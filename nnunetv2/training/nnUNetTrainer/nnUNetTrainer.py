@@ -9,6 +9,8 @@ from datetime import datetime
 from time import time, sleep
 from typing import Tuple, Union, List
 
+import wandb
+
 import numpy as np
 import torch
 from batchgenerators.dataloading.multi_threaded_augmenter import MultiThreadedAugmenter
@@ -960,6 +962,10 @@ class nnUNetTrainer(object):
         empty_cache(self.device)
         self.print_to_log_file("Training done.")
 
+        if self.local_rank == 0:
+            # finish wandb after training
+            wandb.finish()
+
     def on_train_epoch_start(self):
         self.network.train()
         self.lr_scheduler.step(self.current_epoch)
@@ -1013,6 +1019,10 @@ class nnUNetTrainer(object):
             loss_here = np.mean(outputs['loss'])
 
         self.logger.log('train_losses', loss_here, self.current_epoch)
+
+        if self.local_rank == 0:
+            epoch_train_loss = self.logger.my_fantastic_logging['train_losses'][-1]
+            wandb.log({"train_loss": epoch_train_loss}, step=self.current_epoch)
 
     def on_validation_epoch_start(self):
         self.network.eval()
@@ -1117,8 +1127,20 @@ class nnUNetTrainer(object):
         self.logger.log('dice_per_class_or_region', global_dc_per_class, self.current_epoch)
         self.logger.log('val_losses', loss_here, self.current_epoch)
 
+        if self.local_rank == 0:
+            # Log validation loss etc.
+            epoch_val_loss = self.logger.my_fantastic_logging['val_losses'][-1]
+            mean_fg_dice = self.logger.my_fantastic_logging['ema_fg_dice'][-1]
+            wandb.log({
+                "val_loss": epoch_val_loss,
+                "mean_fg_dice": mean_fg_dice,
+            }, step=self.current_epoch)
+
     def on_epoch_start(self):
         self.logger.log('epoch_start_timestamps', time(), self.current_epoch)
+        if self.local_rank == 0:
+            current_lr = self.optimizer.param_groups[0]['lr']
+            wandb.log({"learning_rate": current_lr, "epoch": self.current_epoch}, step=self.current_epoch)
 
     def on_epoch_end(self):
         self.logger.log('epoch_end_timestamps', time(), self.current_epoch)
@@ -1145,6 +1167,9 @@ class nnUNetTrainer(object):
             self.logger.plot_progress_png(self.output_folder)
 
         self.current_epoch += 1
+
+        if self.local_rank == 0:
+            wandb.log({"epoch_end_time": time()}, step=self.current_epoch)
 
     def save_checkpoint(self, filename: str) -> None:
         if self.local_rank == 0:
@@ -1361,6 +1386,18 @@ class nnUNetTrainer(object):
 
     def run_training(self):
         self.on_train_start()
+
+        # Initialize wandb (local_rank 0)
+        if self.local_rank == 0:
+            wandb.init(
+                project="nnUnet_v01",             # Choose a project name
+                name=f"{self.configuration_name}_fold{self.fold}",  # Name of the run
+                config={
+                    "initial_lr": self.initial_lr,
+                    "batch_size": self.configuration_manager.batch_size,
+                    "num_epochs": self.num_epochs,
+                }
+            )
 
         for epoch in range(self.current_epoch, self.num_epochs):
             self.on_epoch_start()
