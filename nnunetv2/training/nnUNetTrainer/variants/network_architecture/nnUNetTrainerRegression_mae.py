@@ -41,6 +41,9 @@ class nnUNetTrainerRegression_mae(nnUNetTrainer):
         self.num_iterations_per_epoch = 250
         self.num_epochs = 1000
         
+        # Initialize MAE loss
+        self.loss = self._build_loss()
+        
         # Parse command line arguments for trilinear support
         self.decoder_type = "standard"  # default
         self._parse_decoder_args()
@@ -216,9 +219,11 @@ class nnUNetTrainerRegression_mae(nnUNetTrainer):
         _ = next(mt_gen_val)
         return mt_gen_train, mt_gen_val
 
-    def validation_step(self, batch: dict) -> dict:
+    def train_step(self, batch: dict) -> dict:
         """
-        Validation step using MAE loss
+        Training step with multi-channel input splitting
+        Channel 0: CBCT (input to network)
+        Channel 1: CT (target for regression)
         """
         data = batch['data']
         target = batch['target']
@@ -229,11 +234,56 @@ class nnUNetTrainerRegression_mae(nnUNetTrainer):
         else:
             target = target.to(self.device, non_blocking=True)
 
+        # Split multi-channel input: Channel 0 = CBCT input, Channel 1 = CT target
+        input_data = data[:, 0:1, ...]  # CBCT channel (keep channel dimension)
+        target_data = data[:, 1:2, ...]  # CT channel (keep channel dimension)
+        
+        self.optimizer.zero_grad(set_to_none=True)
+        # Autocast can be annoying
+        # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
+        # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
+        # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            output = self.network(data)
-            del data
-            mae_loss = myMAE()
-            l = mae_loss(output, target)
+            output = self.network(input_data)
+            # Use MAE loss between network output and target CT
+            l = self.loss(output, target_data)
+
+        if self.grad_scaler is not None:
+            self.grad_scaler.scale(l).backward()
+            self.grad_scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            self.grad_scaler.step(self.optimizer)
+            self.grad_scaler.update()
+        else:
+            l.backward()
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            self.optimizer.step()
+        return {'loss': l.detach().cpu().numpy()}
+
+    def validation_step(self, batch: dict) -> dict:
+        """
+        Validation step with multi-channel input splitting
+        Channel 0: CBCT (input to network)
+        Channel 1: CT (target for regression)
+        """
+        data = batch['data']
+        target = batch['target']
+
+        data = data.to(self.device, non_blocking=True)
+        if isinstance(target, list):
+            target = [i.to(self.device, non_blocking=True) for i in target]
+        else:
+            target = target.to(self.device, non_blocking=True)
+
+        # Split multi-channel input: Channel 0 = CBCT input, Channel 1 = CT target
+        input_data = data[:, 0:1, ...]  # CBCT channel (keep channel dimension)
+        target_data = data[:, 1:2, ...]  # CT channel (keep channel dimension)
+
+        with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+            output = self.network(input_data)
+            del input_data
+            # Use MAE loss between network output and target CT
+            l = self.loss(output, target_data)
 
         return {'loss': l.detach().cpu().numpy(), 'tp_hard': 0, 'fp_hard': 0, 'fn_hard': 0}
 
