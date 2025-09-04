@@ -1,11 +1,14 @@
 import argparse
 import torch
+import warnings
+import multiprocessing
+import os
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.functional import interpolate
 from typing import Union, Tuple, List
 from batchgenerators.transforms.abstract_transforms import AbstractTransform
 import numpy as np
-from time import time
+from time import time, sleep
 # Use the same multi-threading setup as base trainer
 from nnunetv2.utilities.default_n_proc_DA import get_allowed_n_proc_DA
 from batchgenerators.dataloading.single_threaded_augmenter import SingleThreadedAugmenter
@@ -17,9 +20,14 @@ from nnunetv2.training.dataloading.data_loader_regression import nnUNetDataLoade
 from nnunetv2.training.dataloading.data_loader import nnUNetDataLoader
 from nnunetv2.utilities.get_network_from_plans import get_network_from_plans
 from nnunetv2.utilities.collate_outputs import collate_outputs
+from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+from nnunetv2.utilities.file_path_utilities import check_workers_alive_and_busy
+from nnunetv2.configuration import default_num_processes
+from nnunetv2.utilities.helpers import dummy_context
 from torch import autocast
-from batchgenerators.utilities.file_and_folder_operations import join
+from batchgenerators.utilities.file_and_folder_operations import join, maybe_mkdir_p
 from torch import nn
+from torch import distributed as dist
 
 
 class nnUNetTrainerRegression_mae_deep(nnUNetTrainer):
@@ -89,6 +97,11 @@ class nnUNetTrainerRegression_mae_deep(nnUNetTrainer):
                 self.network = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.network)
                 self.network = DDP(self.network, device_ids=[self.local_rank])
             
+            # Override resampling parameters for regression: use full trilinear interpolation
+            # instead of mixed linear/nearest neighbor interpolation used for segmentation
+            self.configuration_manager.configuration['resampling_fn_probabilities_kwargs']['order_z'] = 1
+            self.print_to_log_file('Using full trilinear interpolation for regression predictions (order_z=1)')
+            
             self.was_initialized = True
         else:
             raise RuntimeError("You have called self.initialize even though the trainer was already initialized. "
@@ -153,6 +166,147 @@ class nnUNetTrainerRegression_mae_deep(nnUNetTrainer):
                 downsampled = interpolate(target, new_shape, mode=mode, align_corners=False)
                 results.append(downsampled)
         return results
+
+    def denormalize_prediction(self, prediction: np.ndarray, channel_idx: int = 1) -> np.ndarray:
+        """
+        Denormalize predictions back to original intensity range
+        
+        Args:
+            prediction: Normalized prediction array
+            channel_idx: Channel index for normalization parameters (1 for CT target channel)
+        
+        Returns:
+            Denormalized prediction in original intensity range
+        """
+        # Get normalization info from plans
+        normalization_schemes = self.configuration_manager.normalization_schemes
+        intensity_props = self.plans_manager.foreground_intensity_properties_per_channel
+        
+        if channel_idx >= len(normalization_schemes):
+            self.print_to_log_file(f'Warning: channel_idx {channel_idx} >= number of channels, using channel 0 for denormalization')
+            channel_idx = 0
+            
+        norm_scheme = normalization_schemes[channel_idx]
+        props = intensity_props[str(channel_idx)]
+        
+        self.print_to_log_file(f'Denormalizing with scheme: {norm_scheme}, channel: {channel_idx}')
+        
+        if norm_scheme == 'ZScoreNormalization':
+            # Reverse: x_orig = (x_norm * std) + mean  
+            mean = props['mean']
+            std = props['std']
+            prediction = prediction * std + mean
+            self.print_to_log_file(f'Applied ZScore denormalization: mean={mean:.2f}, std={std:.2f}')
+            
+        elif norm_scheme == 'CTNormalization':
+            # Reverse: x_orig = (x_norm * std) + mean
+            mean = props['mean']
+            std = props['std']  
+            prediction = prediction * std + mean
+            self.print_to_log_file(f'Applied CT denormalization: mean={mean:.2f}, std={std:.2f}')
+            
+        elif norm_scheme == 'RescaleTo01Normalization':
+            # This would need the original min/max, but those aren't stored in intensity properties
+            # For now, just return as-is and warn
+            self.print_to_log_file('Warning: RescaleTo01Normalization denormalization not implemented, returning normalized values')
+            
+        elif norm_scheme == 'NoNormalization':
+            # No denormalization needed
+            self.print_to_log_file('No denormalization applied (NoNormalization scheme)')
+            
+        else:
+            self.print_to_log_file(f'Warning: Unknown normalization scheme {norm_scheme}, returning normalized values')
+            
+        return prediction
+
+    def export_regression_prediction(self, prediction: Union[torch.Tensor, np.ndarray], 
+                                   properties_dict: dict, output_file_truncated: str,
+                                   channel_idx: int = 1) -> None:
+        """
+        Export regression prediction with denormalization and preprocessing reversal
+        
+        Args:
+            prediction: Network prediction (logits/continuous values)
+            properties_dict: Case properties for preprocessing reversal
+            output_file_truncated: Output filename without extension
+            channel_idx: Channel index for denormalization (1 for CT target)
+        """
+        import nibabel as nib
+        from acvl_utils.cropping_and_padding.bounding_boxes import insert_crop_into_image
+        
+        # Convert to numpy if needed
+        if isinstance(prediction, torch.Tensor):
+            prediction = prediction.cpu().numpy()
+        
+        # Remove batch dimension if present and keep only single channel
+        if prediction.ndim == 5:  # [B, C, H, W, D]
+            prediction = prediction[0, 0]  # Take first batch, first channel
+        elif prediction.ndim == 4:  # [C, H, W, D] or [B, H, W, D]
+            if prediction.shape[0] > 1:  # Assume first dim is channels if > 1
+                prediction = prediction[0]  # Take first channel
+            else:
+                prediction = prediction[0]  # Remove batch dimension
+        elif prediction.ndim == 3:  # Already [H, W, D]
+            pass
+        else:
+            raise ValueError(f"Unexpected prediction shape: {prediction.shape}")
+        
+        self.print_to_log_file(f'Processing prediction with shape: {prediction.shape}')
+        
+        # Denormalize prediction
+        prediction_denormalized = self.denormalize_prediction(prediction, channel_idx)
+        
+        # Revert preprocessing steps using existing nnUNet infrastructure
+        # 1. Resample back to original spacing
+        spacing_transposed = [properties_dict['spacing'][i] for i in self.plans_manager.transpose_forward]
+        current_spacing = self.configuration_manager.spacing
+        target_spacing = [properties_dict['spacing'][i] for i in self.plans_manager.transpose_forward]
+        
+        if len(current_spacing) != len(properties_dict['shape_after_cropping_and_before_resampling']):
+            current_spacing = [spacing_transposed[0], *current_spacing]
+        
+        if 'shape_after_cropping_and_before_resampling' in properties_dict:
+            # Add channel dimension for resampling function
+            prediction_with_channel = prediction_denormalized[None]  # Add channel dim
+            prediction_resampled = self.configuration_manager.resampling_fn_probabilities(
+                prediction_with_channel,
+                properties_dict['shape_after_cropping_and_before_resampling'],
+                current_spacing,
+                target_spacing
+            )[0]  # Remove channel dimension
+            self.print_to_log_file(f'Resampled from {prediction_denormalized.shape} to {prediction_resampled.shape}')
+        else:
+            prediction_resampled = prediction_denormalized
+            self.print_to_log_file('No resampling needed')
+        
+        # 2. Revert cropping to original image size
+        if 'bbox_used_for_cropping' in properties_dict:
+            prediction_full = np.zeros(properties_dict['shape_before_cropping'], dtype=np.float32)
+            prediction_full = insert_crop_into_image(prediction_full, prediction_resampled, 
+                                                    properties_dict['bbox_used_for_cropping'])
+            self.print_to_log_file(f'Reverted cropping to shape: {prediction_full.shape}')
+        else:
+            prediction_full = prediction_resampled.astype(np.float32)
+            self.print_to_log_file('No cropping reversal needed')
+        
+        # 3. Revert transpose if needed
+        if hasattr(self.plans_manager, 'transpose_backward'):
+            prediction_final = prediction_full.transpose(self.plans_manager.transpose_backward)
+            self.print_to_log_file(f'Reverted transpose to final shape: {prediction_final.shape}')
+        else:
+            prediction_final = prediction_full
+            self.print_to_log_file('No transpose reversal needed')
+        
+        # Save as NIfTI with proper affine matrix
+        output_filename = f'{output_file_truncated}.nii.gz'
+        affine = properties_dict.get('affine', np.eye(4))
+        
+        # Create NIfTI image and save
+        nifti_img = nib.Nifti1Image(prediction_final, affine=affine)
+        nib.save(nifti_img, output_filename)
+        
+        self.print_to_log_file(f'Saved denormalized prediction to: {output_filename}')
+        self.print_to_log_file(f'Final prediction range: [{prediction_final.min():.2f}, {prediction_final.max():.2f}]')
 
     def build_network_architecture(self, architecture_class_name: str,
                                    arch_init_kwargs: dict,
@@ -405,10 +559,78 @@ class nnUNetTrainerRegression_mae_deep(nnUNetTrainer):
         # Increment the epoch counter
         self.current_epoch += 1
 
+    def perform_actual_validation(self, save_probabilities: bool = False):
+        """
+        Custom validation for regression that saves denormalized predictions
+        """
+        self.set_deep_supervision_enabled(False)
+        self.network.eval()
+        
+        if self.is_ddp and self.batch_size == 1 and self.enable_deep_supervision and self._do_i_compile():
+            self.print_to_log_file("WARNING! batch size is 1 during training and torch.compile is enabled. If you "
+                                   "encounter crashes in validation then this is because torch.compile forgets "
+                                   "to trigger a recompilation of the model with deep supervision disabled. "
+                                   "This causes torch.flip to complain about getting a tuple as input. Just rerun the "
+                                   "validation with --val (exactly the same as before) and then it will work. "
+                                   "Why? Because --val triggers nnU-Net to ONLY run validation meaning that the first "
+                                   "forward pass (where compile is triggered) already has deep supervision disabled. "
+                                   "This is exactly what we need in perform_actual_validation")
 
-# Add dummy context for compatibility
-class dummy_context:
-    def __enter__(self):
-        return self
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        pass
+        # Use nnUNetPredictor for sliding window inference
+        predictor = nnUNetPredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
+                                    perform_everything_on_device=True, device=self.device, verbose=False,
+                                    verbose_preprocessing=False, allow_tqdm=False)
+        predictor.manual_initialization(self.network, self.plans_manager, self.configuration_manager, None,
+                                        self.dataset_json, self.__class__.__name__,
+                                        self.inference_allowed_mirroring_axes)
+
+        validation_output_folder = join(self.output_folder, 'validation')
+        maybe_mkdir_p(validation_output_folder)
+        
+        # Get validation keys
+        _, val_keys = self.do_split()
+        if self.is_ddp:
+            last_barrier_at_idx = len(val_keys) // dist.get_world_size() - 1
+            val_keys = val_keys[self.local_rank:: dist.get_world_size()]
+
+        dataset_val = self.dataset_class(self.preprocessed_dataset_folder, val_keys,
+                                         folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage)
+
+        for i, k in enumerate(dataset_val.identifiers):
+            self.print_to_log_file(f"predicting {k}")
+            data, _, seg_prev, properties = dataset_val.load_case(k)
+            
+            # Convert blosc2 to numpy and split channels
+            data = data[:]  
+            
+            # Use only channel 0 (source modality) as input to network
+            input_data = data[0:1, ...]  # Keep channel dimension
+            
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                input_tensor = torch.from_numpy(input_data)
+            
+            self.print_to_log_file(f'{k}, input shape {input_tensor.shape}, rank {self.local_rank}')
+            
+            # Get prediction using sliding window
+            prediction = predictor.predict_sliding_window_return_logits(input_tensor)
+            prediction = prediction.cpu()
+            
+            # Export denormalized prediction using our custom function
+            output_file_truncated = join(validation_output_folder, k)
+            self.export_regression_prediction(prediction, properties, output_file_truncated, channel_idx=1)
+            
+            # Handle DDP barriers for large datasets
+            if self.is_ddp and i < last_barrier_at_idx and (i + 1) % 20 == 0:
+                dist.barrier()
+        
+        if self.is_ddp:
+            dist.barrier()
+        
+        # Re-enable deep supervision
+        self.set_deep_supervision_enabled(True)
+        
+        if self.local_rank == 0:
+            self.print_to_log_file("Regression validation complete - denormalized predictions saved", also_print_to_console=True)
+            self.print_to_log_file(f"Predictions saved in: {validation_output_folder}", also_print_to_console=True)
+
