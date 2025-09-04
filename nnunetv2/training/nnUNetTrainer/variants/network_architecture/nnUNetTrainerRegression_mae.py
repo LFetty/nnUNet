@@ -1,13 +1,18 @@
 import argparse
 import torch
+from torch.nn.parallel import DistributedDataParallel as DDP
 from typing import Union, Tuple, List
 from batchgenerators.transforms.abstract_transforms import AbstractTransform
 import numpy as np
 from time import time
-
+# Use the same multi-threading setup as base trainer
+from nnunetv2.utilities.default_n_proc_DA import get_allowed_n_proc_DA
+from batchgenerators.dataloading.single_threaded_augmenter import SingleThreadedAugmenter
+from batchgenerators.dataloading.nondet_multi_threaded_augmenter import NonDetMultiThreadedAugmenter
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from nnunetv2.training.loss.mae import myMAE
 from nnunetv2.training.dataloading.data_loader_regression import nnUNetDataLoader2D_Regression, nnUNetDataLoader3D_Regression
+from nnunetv2.training.dataloading.data_loader import nnUNetDataLoader
 from nnunetv2.utilities.get_network_from_plans import get_network_from_plans
 from nnunetv2.utilities.collate_outputs import collate_outputs
 from torch import autocast
@@ -33,10 +38,9 @@ class nnUNetTrainerRegression_mae(nnUNetTrainer):
         configuration: str,
         fold: int,
         dataset_json: dict,
-        unpack_dataset: bool = True,
         device: torch.device = torch.device("cuda"),
     ):
-        super().__init__(plans, configuration, fold, dataset_json, unpack_dataset, device)
+        super().__init__(plans, configuration, fold, dataset_json, device)
         self.enable_deep_supervision = False
         self.num_iterations_per_epoch = 250
         self.num_epochs = 1000
@@ -47,6 +51,44 @@ class nnUNetTrainerRegression_mae(nnUNetTrainer):
         # Parse command line arguments for trilinear support
         self.decoder_type = "standard"  # default
         self._parse_decoder_args()
+
+    def initialize(self):
+        """
+        Override to use 1 input channel for network (since we split channels manually)
+        """
+        if not self.was_initialized:
+            # DDP batch size and oversampling can differ between workers and needs adaptation
+            self._set_batch_size_and_oversample()
+
+            self.num_input_channels = 1  # Force 1 input channel for regression
+            self.num_output_channels = 1  # Force 1 output channel for regression
+
+            self.network = self.build_network_architecture(
+                self.configuration_manager.network_arch_class_name,
+                self.configuration_manager.network_arch_init_kwargs,
+                self.configuration_manager.network_arch_init_kwargs_req_import,
+                self.num_input_channels,
+                self.num_output_channels,
+                self.enable_deep_supervision
+            ).to(self.device)
+            
+            # Skip torch.compile for regression to avoid shape mismatch issues
+            if self._do_i_compile():
+                self.print_to_log_file('Using torch.compile...')
+                self.network = torch.compile(self.network)
+            
+            # optimizer, lr_scheduler and loss are initialized here
+            self.optimizer, self.lr_scheduler = self.configure_optimizers()
+            
+            # if ddp, wrap in DDP wrapper
+            if self.is_ddp:
+                self.network = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.network)
+                self.network = DDP(self.network, device_ids=[self.local_rank])
+            
+            self.was_initialized = True
+        else:
+            raise RuntimeError("You have called self.initialize even though the trainer was already initialized. "
+                             "That should not happen.")
 
     def _parse_decoder_args(self):
         """Parse command line arguments to check for trilinear decoder option"""
@@ -124,7 +166,7 @@ class nnUNetTrainerRegression_mae(nnUNetTrainer):
         """
         if self.dataset_class is None:
             from nnunetv2.utilities.dataset_name_id_conversion import find_candidate_datasets
-            from nnunetv2.utilities.utils import infer_dataset_class
+            from nnunetv2.training.dataloading.nnunet_dataset import infer_dataset_class
             self.dataset_class = infer_dataset_class(self.preprocessed_dataset_folder)
 
         # we use the patch size to determine whether we need 2D or 3D dataloaders. We also use it to determine whether
@@ -135,69 +177,49 @@ class nnUNetTrainerRegression_mae(nnUNetTrainer):
         # outputs?
         deep_supervision_scales = self._get_deep_supervision_scales()
 
-        (
-            rotation_for_DA,
-            do_dummy_2d_data_aug,
-            initial_patch_size,
-            mirror_axes,
-        ) = self.configure_rotation_dummyDA_mirroring_and_inital_patch_size()
+        # (
+        #     rotation_for_DA,
+        #     do_dummy_2d_data_aug,
+        #     initial_patch_size,
+        #     mirror_axes,
+        # ) = self.configure_rotation_dummyDA_mirroring_and_inital_patch_size()
 
-        # training pipeline
-        tr_transforms = self.get_training_transforms(
-            patch_size, rotation_for_DA, deep_supervision_scales, mirror_axes, do_dummy_2d_data_aug,
-            use_mask_for_norm=self.configuration_manager.use_mask_for_norm,
-            is_cascaded=self.is_cascaded, foreground_labels=self.label_manager.foreground_labels,
-            regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
-            ignore_label=self.label_manager.ignore_label)
+        # # Use validation transforms for both training and validation to avoid augmentation issues
+        # # but still get proper tensor conversion
+        # tr_transforms = self.get_validation_transforms(deep_supervision_scales,
+        #                                                is_cascaded=self.is_cascaded,
+        #                                                foreground_labels=self.label_manager.foreground_labels,
+        #                                                regions=self.label_manager.foreground_regions if
+        #                                                self.label_manager.has_regions else None,
+        #                                                ignore_label=self.label_manager.ignore_label)
 
-        # validation pipeline  
-        val_transforms = self.get_validation_transforms(deep_supervision_scales,
-                                                        is_cascaded=self.is_cascaded,
-                                                        foreground_labels=self.label_manager.foreground_labels,
-                                                        regions=self.label_manager.foreground_regions if
-                                                        self.label_manager.has_regions else None,
-                                                        ignore_label=self.label_manager.ignore_label)
+        # # validation pipeline  
+        # val_transforms = self.get_validation_transforms(deep_supervision_scales,
+        #                                                 is_cascaded=self.is_cascaded,
+        #                                                 foreground_labels=self.label_manager.foreground_labels,
+        #                                                 regions=self.label_manager.foreground_regions if
+        #                                                 self.label_manager.has_regions else None,
+        #                                                 ignore_label=self.label_manager.ignore_label)
 
         dataset_tr, dataset_val = self.get_tr_and_val_datasets()
 
         # Determine if we need 2D or 3D based on patch size
         dim = len(patch_size)
         
-        if dim == 2:
-            dl_tr = nnUNetDataLoader2D_Regression(dataset_tr, self.batch_size,
-                                       initial_patch_size,
-                                       self.configuration_manager.patch_size,
-                                       self.label_manager,
-                                       oversample_foreground_percent=self.oversample_foreground_percent,
-                                       sampling_probabilities=None, pad_sides=None, transforms=tr_transforms,
-                                       probabilistic_oversampling=self.probabilistic_oversampling)
-            dl_val = nnUNetDataLoader2D_Regression(dataset_val, self.batch_size,
-                                        self.configuration_manager.patch_size,
-                                        self.configuration_manager.patch_size,
-                                        self.label_manager,
-                                        oversample_foreground_percent=self.oversample_foreground_percent,
-                                        sampling_probabilities=None, pad_sides=None, transforms=val_transforms,
-                                        probabilistic_oversampling=self.probabilistic_oversampling)
-        else:
-            dl_tr = nnUNetDataLoader3D_Regression(dataset_tr, self.batch_size,
-                                       initial_patch_size,
-                                       self.configuration_manager.patch_size,
-                                       self.label_manager,
-                                       oversample_foreground_percent=self.oversample_foreground_percent,
-                                       sampling_probabilities=None, pad_sides=None, transforms=tr_transforms,
-                                       probabilistic_oversampling=self.probabilistic_oversampling)
-            dl_val = nnUNetDataLoader3D_Regression(dataset_val, self.batch_size,
-                                        self.configuration_manager.patch_size,
-                                        self.configuration_manager.patch_size,
-                                        self.label_manager,
-                                        oversample_foreground_percent=self.oversample_foreground_percent,
-                                        sampling_probabilities=None, pad_sides=None, transforms=val_transforms,
-                                        probabilistic_oversampling=self.probabilistic_oversampling)
-
-        # Use the same multi-threading setup as base trainer
-        from nnunetv2.utilities.helpers import get_allowed_n_proc_DA
-        from batchgenerators.dataloading.single_threaded_augmenter import SingleThreadedAugmenter
-        from batchgenerators.dataloading.nondet_multi_threaded_augmenter import NonDetMultiThreadedAugmenter
+        dl_tr = nnUNetDataLoader(dataset_tr, self.batch_size,
+                                    self.configuration_manager.patch_size,
+                                    self.configuration_manager.patch_size,
+                                    self.label_manager,
+                                    oversample_foreground_percent=self.oversample_foreground_percent,
+                                    sampling_probabilities=None, pad_sides=None, #transforms=tr_transforms,
+                                    probabilistic_oversampling=self.probabilistic_oversampling)
+        dl_val = nnUNetDataLoader(dataset_val, self.batch_size,
+                                    self.configuration_manager.patch_size,
+                                    self.configuration_manager.patch_size,
+                                    self.label_manager,
+                                    oversample_foreground_percent=self.oversample_foreground_percent,
+                                    sampling_probabilities=None, pad_sides=None, #transforms=val_transforms,
+                                    probabilistic_oversampling=self.probabilistic_oversampling)
         
         allowed_num_processes = get_allowed_n_proc_DA()
         if allowed_num_processes == 0:
@@ -225,8 +247,8 @@ class nnUNetTrainerRegression_mae(nnUNetTrainer):
         Channel 0: CBCT (input to network)
         Channel 1: CT (target for regression)
         """
-        data = batch['data']
-        target = batch['target']
+        data = torch.from_numpy(batch['data'])
+        target = torch.from_numpy(batch['target'])
 
         data = data.to(self.device, non_blocking=True)
         if isinstance(target, list):
@@ -266,8 +288,8 @@ class nnUNetTrainerRegression_mae(nnUNetTrainer):
         Channel 0: CBCT (input to network)
         Channel 1: CT (target for regression)
         """
-        data = batch['data']
-        target = batch['target']
+        data = torch.from_numpy(batch['data'])
+        target = torch.from_numpy(batch['target'])
 
         data = data.to(self.device, non_blocking=True)
         if isinstance(target, list):
