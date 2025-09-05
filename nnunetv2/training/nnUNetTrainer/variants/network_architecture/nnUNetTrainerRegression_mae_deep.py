@@ -197,6 +197,13 @@ class nnUNetTrainerRegression_mae_deep(nnUNetTrainer):
             std = props['std']
             prediction = prediction * std + mean
             self.print_to_log_file(f'Applied ZScore denormalization: mean={mean:.2f}, std={std:.2f}')
+        
+        elif norm_scheme == 'GlobalNormalization':
+            # Reverse: x_orig = (x_norm * std) + mean  
+            mean = props['mean']
+            std = props['std']
+            prediction = prediction * std + mean
+            self.print_to_log_file(f'Applied Global denormalization: mean={mean:.2f}, std={std:.2f}')
             
         elif norm_scheme == 'CTNormalization':
             # Reverse: x_orig = (x_norm * std) + mean
@@ -297,13 +304,24 @@ class nnUNetTrainerRegression_mae_deep(nnUNetTrainer):
             prediction_final = prediction_full
             self.print_to_log_file('No transpose reversal needed')
         
-        # Save as NIfTI with proper affine matrix
-        output_filename = f'{output_file_truncated}.nii.gz'
-        affine = properties_dict.get('affine', np.eye(4))
+        # Save using SimpleITK to preserve float32 values and correct orientation
+        import SimpleITK as sitk
         
-        # Create NIfTI image and save
-        nifti_img = nib.Nifti1Image(prediction_final, affine=affine)
-        nib.save(nifti_img, output_filename)
+        output_filename = f'{output_file_truncated}{self.dataset_json["file_ending"]}'
+        
+        # Check if it's 2D (remove singleton first dimension if present)
+        output_dimension = len(properties_dict['sitk_stuff']['spacing'])
+        if output_dimension == 2 and prediction_final.ndim == 3:
+            prediction_final = prediction_final[0]
+        
+        # Create SimpleITK image with float32 precision (no conversion to uint8/uint16)
+        itk_image = sitk.GetImageFromArray(prediction_final.astype(np.float32, copy=False))
+        itk_image.SetSpacing(properties_dict['sitk_stuff']['spacing'])
+        itk_image.SetOrigin(properties_dict['sitk_stuff']['origin'])
+        itk_image.SetDirection(properties_dict['sitk_stuff']['direction'])
+        
+        # Write image preserving float32 values
+        sitk.WriteImage(itk_image, output_filename, True)
         
         self.print_to_log_file(f'Saved denormalized prediction to: {output_filename}')
         self.print_to_log_file(f'Final prediction range: [{prediction_final.min():.2f}, {prediction_final.max():.2f}]')
