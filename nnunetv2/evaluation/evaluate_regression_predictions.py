@@ -248,19 +248,18 @@ def compute_regression_metrics_on_folder(folder_ref: str, folder_pred: str, outp
     
     # For regression, we don't have "foreground" vs "background" like segmentation
     # So we just use the overall means as the summary
-    
-    recursive_fix_for_json_export(results)
-    recursive_fix_for_json_export(means)
-    
+
     result = {
-        'metric_per_case': results, 
+        'metric_per_case': results,
         'mean': means,
         'num_cases': len(results),
         'valid_cases': {
-            metric: len([r[metric] for r in results if not np.isnan(r[metric])]) 
+            metric: len([r[metric] for r in results if not np.isnan(r[metric])])
             for metric in metric_names
         }
     }
+
+    recursive_fix_for_json_export(result)
     
     if output_file is not None:
         save_regression_summary_json(result, output_file)
