@@ -400,11 +400,13 @@ class nnUNetPredictor(object):
 
                 if ofile is not None:
                     print('sending off prediction to background worker for resampling and export')
+                    # Check if using regression trainer
+                    is_regression = hasattr(self, 'trainer_name') and 'Regression' in self.trainer_name
                     r.append(
                         export_pool.apply_async(
                             export_prediction_from_logits,
                             (prediction, properties, self.configuration_manager, self.plans_manager,
-                             self.dataset_json, ofile, save_probabilities)
+                             self.dataset_json, ofile, save_probabilities, default_num_processes, is_regression)
                         )
                     )
                 else:

@@ -17,6 +17,7 @@ from nnunetv2.utilities.get_network_from_plans import get_network_from_plans
 from nnunetv2.utilities.collate_outputs import collate_outputs
 from torch import autocast
 from batchgenerators.utilities.file_and_folder_operations import join
+from acvl_utils.cropping_and_padding.bounding_boxes import insert_crop_into_image
 from torch import nn
 
 
@@ -106,27 +107,43 @@ class nnUNetTrainerRegression_mae(nnUNetTrainer):
         loss = myMAE()
         return loss
 
-    def build_network_architecture(self, architecture_class_name: str,
+    @staticmethod
+    def build_network_architecture(architecture_class_name: str,
                                    arch_init_kwargs: dict,
                                    arch_init_kwargs_req_import: Union[List[str], Tuple[str, ...]],
                                    num_input_channels: int,
                                    num_output_channels: int,
                                    enable_deep_supervision: bool = True) -> nn.Module:
         """
-        Build network architecture with optional trilinear decoder support
+        Build network architecture for regression with forced 1 input/1 output channels
         """
+        # Force regression-specific channel numbers regardless of what's passed
+        # Regression always uses 1 input channel (source modality) and 1 output channel (target)
+        regression_input_channels = 1
+        regression_output_channels = 1
+        
+        # Since this is static, we can't access self.decoder_type
+        # Check command line args directly for trilinear support
+        decoder_type = "standard"
+        try:
+            import sys
+            if '--trilinear' in sys.argv:
+                decoder_type = "trilinear"
+        except:
+            pass
+        
         # Add decoder_type to architecture kwargs if supported
-        if self.decoder_type != "standard":
+        if decoder_type != "standard":
             arch_init_kwargs = arch_init_kwargs.copy()
-            arch_init_kwargs['decoder_type'] = self.decoder_type
-            print(f"Building network with {self.decoder_type} decoder")
+            arch_init_kwargs['decoder_type'] = decoder_type
+            print(f"Building regression network with {decoder_type} decoder")
         
         return get_network_from_plans(
             architecture_class_name,
             arch_init_kwargs,
             arch_init_kwargs_req_import,
-            num_input_channels,
-            num_output_channels,
+            regression_input_channels,
+            regression_output_channels,
             allow_init=True,
             deep_supervision=enable_deep_supervision)
 
@@ -351,6 +368,81 @@ class nnUNetTrainerRegression_mae(nnUNetTrainer):
         # Increment the epoch counter
         self.current_epoch += 1
 
+    def _compute_validation_metrics(self, validation_output_folder: str):
+        """
+        Compute regression validation metrics (MAE, PSNR, SSIM) and save summary JSON
+        
+        Args:
+            validation_output_folder: Folder containing validation predictions
+        """
+        try:
+            from nnunetv2.evaluation.evaluate_regression_predictions import compute_regression_metrics_on_folder
+            from nnunetv2.paths import nnUNet_raw, nnUNet_preprocessed
+            from batchgenerators.utilities.file_and_folder_operations import isdir
+            
+            # Get ground truth folder - check multiple possible locations
+            gt_folder_candidates = [
+                join(nnUNet_raw, self.plans_manager.dataset_name, 'imagesTr'),  # Raw training images (channel 1 contains GT)
+                join(nnUNet_preprocessed, self.plans_manager.dataset_name, 'gt_images'),  # Custom preprocessed GT folder
+            ]
+            
+            gt_folder = None
+            for candidate in gt_folder_candidates:
+                if isdir(candidate):
+                    gt_folder = candidate
+                    break
+            
+            if gt_folder is None:
+                self.print_to_log_file("Warning: Could not find ground truth folder for validation metrics computation", also_print_to_console=True)
+                self.print_to_log_file(f"Searched in: {gt_folder_candidates}", also_print_to_console=True)
+                return
+                
+            self.print_to_log_file(f"Computing validation metrics using GT folder: {gt_folder}", also_print_to_console=True)
+            
+            # Get image reader/writer from plans
+            rw = self.plans_manager.image_reader_writer_class()
+            file_ending = self.dataset_json['file_ending']
+            
+            # Compute metrics
+            output_file = join(validation_output_folder, 'validation_summary.json')
+            
+            self.print_to_log_file("Computing regression metrics (MAE, PSNR, SSIM)...", also_print_to_console=True)
+            
+            try:
+                result = compute_regression_metrics_on_folder(
+                    folder_ref=gt_folder,
+                    folder_pred=validation_output_folder,
+                    output_file=output_file,
+                    image_reader_writer=rw,
+                    file_ending=file_ending,
+                    num_processes=4,  # Use fewer processes to avoid memory issues
+                    chill=True  # Don't crash if some files are missing
+                )
+                
+                # Log summary metrics
+                if 'mean' in result:
+                    mean_metrics = result['mean']
+                    self.print_to_log_file("=== Regression Validation Metrics ===", also_print_to_console=True)
+                    if not np.isnan(mean_metrics.get('MAE', np.nan)):
+                        self.print_to_log_file(f"Mean Absolute Error (MAE): {mean_metrics['MAE']:.4f}", also_print_to_console=True)
+                    if not np.isnan(mean_metrics.get('PSNR', np.nan)):
+                        self.print_to_log_file(f"Peak Signal-to-Noise Ratio (PSNR): {mean_metrics['PSNR']:.2f} dB", also_print_to_console=True)
+                    if not np.isnan(mean_metrics.get('SSIM', np.nan)):
+                        self.print_to_log_file(f"Structural Similarity (SSIM): {mean_metrics['SSIM']:.4f}", also_print_to_console=True)
+                    self.print_to_log_file("=====================================", also_print_to_console=True)
+                    
+                self.print_to_log_file(f"Validation metrics saved to: {output_file}", also_print_to_console=True)
+                
+            except Exception as e:
+                self.print_to_log_file(f"Error computing regression metrics: {str(e)}", also_print_to_console=True)
+                self.print_to_log_file("This may be due to missing ground truth files or incompatible file formats", also_print_to_console=True)
+                
+        except ImportError as e:
+            self.print_to_log_file(f"Could not import regression evaluation module: {str(e)}", also_print_to_console=True)
+            self.print_to_log_file("Regression metrics computation skipped", also_print_to_console=True)
+        except Exception as e:
+            self.print_to_log_file(f"Unexpected error in regression metrics computation: {str(e)}", also_print_to_console=True)
+
     def denormalize_prediction(self, prediction: np.ndarray, channel_idx: int = 1) -> np.ndarray:
         """
         Denormalize predictions back to original intensity range
@@ -381,7 +473,12 @@ class nnUNetTrainerRegression_mae(nnUNetTrainer):
             std = props['std']
             prediction = prediction * std + mean
             self.print_to_log_file(f'Applied ZScore denormalization: mean={mean:.2f}, std={std:.2f}')
-            
+        elif norm_scheme == 'GlobalNormalization':
+            # Reverse: x_orig = (x_norm * std) + mean
+            mean = props['mean']
+            std = props['std']
+            prediction = prediction * std + mean
+            self.print_to_log_file(f'Applied Global denormalization: mean={mean:.2f}, std={std:.2f}')
         elif norm_scheme == 'CTNormalization':
             # Reverse: x_orig = (x_norm * std) + mean
             mean = props['mean']
@@ -403,22 +500,60 @@ class nnUNetTrainerRegression_mae(nnUNetTrainer):
             
         return prediction
 
-    def export_regression_prediction(self, prediction: Union[torch.Tensor, np.ndarray], 
-                                   properties_dict: dict, output_file_truncated: str,
-                                   channel_idx: int = 1) -> None:
+    @torch.inference_mode()
+    def predict_logits_from_preprocessed_data(self, data: torch.Tensor, 
+                                            apply_denormalization: bool = False) -> torch.Tensor:
         """
-        Export regression prediction with denormalization and preprocessing reversal
+        Regression-specific prediction with channel splitting and optional denormalization.
         
         Args:
-            prediction: Network prediction (logits/continuous values)
-            properties_dict: Case properties for preprocessing reversal
-            output_file_truncated: Output filename without extension
-            channel_idx: Channel index for denormalization (1 for CT target)
+            data: Preprocessed input data with 2 channels [source, target]
+            apply_denormalization: If True, apply denormalization to return original intensity ranges
+            
+        Returns:
+            Prediction tensor (optionally denormalized)
         """
-        import nibabel as nib
-        from acvl_utils.cropping_and_padding.bounding_boxes import insert_crop_into_image
+            
+        # Channel splitting: use only channel 0 (source modality) for network input
+        input_data = data[:, 0:1, ...]  # Keep channel dimension, remove target channel
+               
+        # Get network prediction using parent class method
+        prediction = super().predict_logits_from_preprocessed_data(input_data)
+               
+        # Optional denormalization to original intensity ranges
+        if apply_denormalization:
+            # Convert to numpy for denormalization
+            prediction_np = prediction.cpu().numpy()
+            
+            # Apply denormalization using existing method (channel_idx=1 for CT target)
+            prediction_denormalized = self.denormalize_prediction(prediction_np, channel_idx=1)
+            
+            # Convert back to tensor
+            prediction = torch.from_numpy(prediction_denormalized).to(prediction.device)
+                
+        return prediction
+
+    def _postprocess_regression_prediction(self, prediction: Union[torch.Tensor, np.ndarray], 
+                                         properties_dict: dict, 
+                                         apply_denormalization: bool = True,
+                                         channel_idx: int = 1) -> np.ndarray:
+        """
+        Shared method for regression prediction post-processing:
+        - Handle tensor/numpy conversion and shape normalization
+        - Apply denormalization to original intensity ranges  
+        - Revert preprocessing (resampling, cropping, transpose)
         
-        # Convert to numpy if needed
+        Args:
+            prediction: Network prediction (tensor or numpy array)
+            properties_dict: Case properties for preprocessing reversal
+            apply_denormalization: Whether to denormalize to original intensity ranges
+            channel_idx: Channel index for denormalization parameters
+            
+        Returns:
+            Processed numpy array ready for saving (in original space and intensity range)
+        """
+
+        # Convert to numpy if needed and normalize shape
         if isinstance(prediction, torch.Tensor):
             prediction = prediction.cpu().numpy()
         
@@ -430,15 +565,15 @@ class nnUNetTrainerRegression_mae(nnUNetTrainer):
                 prediction = prediction[0]  # Take first channel
             else:
                 prediction = prediction[0]  # Remove batch dimension
-        elif prediction.ndim == 3:  # Already [H, W, D]
             pass
         else:
             raise ValueError(f"Unexpected prediction shape: {prediction.shape}")
         
         self.print_to_log_file(f'Processing prediction with shape: {prediction.shape}')
         
-        # Denormalize prediction
-        prediction_denormalized = self.denormalize_prediction(prediction, channel_idx)
+        # Apply denormalization to original intensity ranges
+        if apply_denormalization:
+            prediction = self.denormalize_prediction(prediction, channel_idx)
         
         # Revert preprocessing steps using existing nnUNet infrastructure
         # 1. Resample back to original spacing
@@ -451,16 +586,16 @@ class nnUNetTrainerRegression_mae(nnUNetTrainer):
         
         if 'shape_after_cropping_and_before_resampling' in properties_dict:
             # Add channel dimension for resampling function
-            prediction_with_channel = prediction_denormalized[None]  # Add channel dim
+            prediction_with_channel = prediction[None]  # Add channel dim
             prediction_resampled = self.configuration_manager.resampling_fn_probabilities(
                 prediction_with_channel,
                 properties_dict['shape_after_cropping_and_before_resampling'],
                 current_spacing,
                 target_spacing
             )[0]  # Remove channel dimension
-            self.print_to_log_file(f'Resampled from {prediction_denormalized.shape} to {prediction_resampled.shape}')
+            self.print_to_log_file(f'Resampled from {prediction.shape} to {prediction_resampled.shape}')
         else:
-            prediction_resampled = prediction_denormalized
+            prediction_resampled = prediction
             self.print_to_log_file('No resampling needed')
         
         # 2. Revert cropping to original image size
@@ -480,19 +615,31 @@ class nnUNetTrainerRegression_mae(nnUNetTrainer):
         else:
             prediction_final = prediction_full
             self.print_to_log_file('No transpose reversal needed')
+            
+        return prediction_final
+    
+    def _save_regression_prediction(self, prediction_processed: np.ndarray,
+                                  properties_dict: dict, 
+                                  output_file_truncated: str) -> None:
+        """
+        Shared method for saving regression predictions as float32 NIfTI files
         
-        # Save using SimpleITK to preserve float32 values and correct orientation
+        Args:
+            prediction_processed: Processed prediction array in original space
+            properties_dict: Case properties for spatial information
+            output_file_truncated: Output filename without extension
+        """
         import SimpleITK as sitk
         
         output_filename = f'{output_file_truncated}{self.dataset_json["file_ending"]}'
         
         # Check if it's 2D (remove singleton first dimension if present)
         output_dimension = len(properties_dict['sitk_stuff']['spacing'])
-        if output_dimension == 2 and prediction_final.ndim == 3:
-            prediction_final = prediction_final[0]
+        if output_dimension == 2 and prediction_processed.ndim == 3:
+            prediction_processed = prediction_processed[0]
         
         # Create SimpleITK image with float32 precision (no conversion to uint8/uint16)
-        itk_image = sitk.GetImageFromArray(prediction_final.astype(np.float32, copy=False))
+        itk_image = sitk.GetImageFromArray(prediction_processed.astype(np.float32, copy=False))
         itk_image.SetSpacing(properties_dict['sitk_stuff']['spacing'])
         itk_image.SetOrigin(properties_dict['sitk_stuff']['origin'])
         itk_image.SetDirection(properties_dict['sitk_stuff']['direction'])
@@ -500,8 +647,82 @@ class nnUNetTrainerRegression_mae(nnUNetTrainer):
         # Write image preserving float32 values
         sitk.WriteImage(itk_image, output_filename, True)
         
-        self.print_to_log_file(f'Saved denormalized prediction to: {output_filename}')
-        self.print_to_log_file(f'Final prediction range: [{prediction_final.min():.2f}, {prediction_final.max():.2f}]')
+        self.print_to_log_file(f'Saved regression prediction to: {output_filename}')
+        self.print_to_log_file(f'Final prediction range: [{prediction_processed.min():.2f}, {prediction_processed.max():.2f}]')
+
+    def export_regression_prediction(self, prediction: Union[torch.Tensor, np.ndarray], 
+                                   properties_dict: dict, output_file_truncated: str,
+                                   channel_idx: int = 1) -> None:
+        """
+        Export regression prediction with denormalization and preprocessing reversal
+        (Now uses shared helper methods to avoid code duplication)
+        
+        Args:
+            prediction: Network prediction (logits/continuous values)
+            properties_dict: Case properties for preprocessing reversal
+            output_file_truncated: Output filename without extension
+            channel_idx: Channel index for denormalization (1 for CT target)
+        """
+        # Use shared post-processing method
+        processed_prediction = self._postprocess_regression_prediction(
+            prediction, properties_dict, apply_denormalization=True, channel_idx=channel_idx
+        )
+        
+        # Use shared saving method  
+        self._save_regression_prediction(processed_prediction, properties_dict, output_file_truncated)
+
+    def predict_from_data_iterator(self, data_iterator, save_probabilities: bool = False, 
+                                 num_processes_segmentation_export: int = 3):
+        """
+        Custom prediction pipeline for regression that bypasses segmentation post-processing.
+        This fixes the zero predictions issue by avoiding argmax() on continuous values.
+        
+        Args:
+            data_iterator: Iterator providing preprocessed data
+            save_probabilities: Ignored for regression (kept for interface compatibility)  
+            num_processes_segmentation_export: Ignored (regression export is sequential)
+        """
+        from nnunetv2.utilities.file_path_utilities import check_workers_alive_and_busy
+        from time import sleep
+        import os
+        
+        results = []
+        for preprocessed in data_iterator:
+            # Extract data and metadata
+            data = preprocessed['data']
+            if isinstance(data, str):
+                # Load from temp file and clean up
+                delfile = data
+                data = torch.from_numpy(np.load(data))
+                os.remove(delfile)
+
+            ofile = preprocessed['ofile']
+            properties = preprocessed['data_properties']
+            
+            if ofile is not None:
+                print(f'\nPredicting {os.path.basename(ofile)}:')
+            else:
+                print(f'\nPredicting image of shape {data.shape}:')
+
+            # Get regression prediction (automatically handles channel splitting)
+            prediction = self.predict_logits_from_preprocessed_data(data)
+            
+            if ofile is not None:
+                print('Processing regression prediction with denormalization and export')
+                # Use shared post-processing and saving (bypasses segmentation pipeline)
+                processed_prediction = self._postprocess_regression_prediction(
+                    prediction, properties, apply_denormalization=True, channel_idx=1
+                )
+                self._save_regression_prediction(processed_prediction, properties, ofile)
+                results.append(None)  # Maintain interface compatibility
+            else:
+                # Return processed prediction for non-file workflows
+                processed_prediction = self._postprocess_regression_prediction(
+                    prediction, properties, apply_denormalization=True, channel_idx=1
+                )
+                results.append(processed_prediction)
+        
+        return results
 
     def perform_actual_validation(self, save_probabilities: bool = False):
         """
@@ -565,9 +786,12 @@ class nnUNetTrainerRegression_mae(nnUNetTrainer):
             prediction = predictor.predict_sliding_window_return_logits(input_tensor)
             prediction = prediction.cpu()
             
-            # Export denormalized prediction using our custom function
+            # Use shared post-processing and saving methods
             output_file_truncated = join(validation_output_folder, k)
-            self.export_regression_prediction(prediction, properties, output_file_truncated, channel_idx=1)
+            processed_prediction = self._postprocess_regression_prediction(
+                prediction, properties, apply_denormalization=True, channel_idx=1
+            )
+            self._save_regression_prediction(processed_prediction, properties, output_file_truncated)
             
             # Handle DDP barriers for large datasets
             if self.is_ddp and i < last_barrier_at_idx and (i + 1) % 20 == 0:
@@ -582,6 +806,9 @@ class nnUNetTrainerRegression_mae(nnUNetTrainer):
         if self.local_rank == 0:
             self.print_to_log_file("Regression validation complete - denormalized predictions saved", also_print_to_console=True)
             self.print_to_log_file(f"Predictions saved in: {validation_output_folder}", also_print_to_console=True)
+            
+            # Compute regression metrics (MAE, PSNR, SSIM)
+            self._compute_validation_metrics(validation_output_folder)
 
 
 # Add dummy context for compatibility
