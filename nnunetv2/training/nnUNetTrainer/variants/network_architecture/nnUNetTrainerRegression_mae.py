@@ -416,7 +416,8 @@ class nnUNetTrainerRegression_mae(nnUNetTrainer):
                     image_reader_writer=rw,
                     file_ending=file_ending,
                     num_processes=4,  # Use fewer processes to avoid memory issues
-                    chill=True  # Don't crash if some files are missing
+                    chill=True,  # Don't crash if some files are missing
+                    save_masks=True  # Save masks to validation_mask folder for inspection
                 )
                 
                 # Log summary metrics
