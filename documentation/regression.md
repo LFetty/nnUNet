@@ -37,6 +37,9 @@ The regression trainer (`nnUNetTrainerRegression_mae`) extends nnUNet to perform
 - **Enabled deep supervision** for improved gradient flow and training stability
 - **Manual target downsampling** with linear interpolation (trilinear/bilinear) for regression
 - **Multi-scale loss computation** with exponential weighting (1, 1/2, 1/4, ...)
+- **Denormalized prediction export** - automatically saves predictions in original intensity ranges
+- **Full trilinear interpolation** for continuous data (order_z=1 instead of nearest neighbor)
+- **Custom validation with preprocessing reversal** - handles cropping, spacing, and orientation
 - Automatic network multi-scale output handling via `DeepSupervisionWrapper`
 
 ### 2. Data Loaders: `nnUNetDataLoader2D_Regression` / `nnUNetDataLoader3D_Regression`
@@ -112,6 +115,16 @@ nnUNetv2_train -d DATASET_ID -tr nnUNetTrainerRegression_mae_deep
 nnUNetv2_train -d DATASET_ID -tr nnUNetTrainerRegression_mae_deep --trilinear
 ```
 
+### Validation with Denormalized Predictions
+
+```bash
+# Run validation to generate denormalized predictions
+nnUNetv2_train -d DATASET_ID -tr nnUNetTrainerRegression_mae_deep --val
+
+# Predictions will be saved in: {output_folder}/validation/
+# Format: Denormalized float32 NIfTI files in original intensity ranges
+```
+
 ### Inference
 
 ```bash
@@ -123,6 +136,8 @@ nnUNetv2_predict -d DATASET_ID -i INPUT_DIR -o OUTPUT_DIR \
 nnUNetv2_predict -d DATASET_ID -i INPUT_DIR -o OUTPUT_DIR \
     -tr nnUNetTrainerRegression_mae_deep -c 3d_fullres -f FOLD
 ```
+
+**Note**: Both trainers automatically bypass segmentation post-processing and export denormalized predictions as float32 NIfTI files in original intensity ranges (e.g., CT Hounsfield Units). Predictions use full trilinear interpolation (`order_z=1`) for smooth continuous data resampling.
 
 ## Implementation Details
 
@@ -147,6 +162,28 @@ The regression data loaders use foreground-based cropping guided by the field-of
 - Improves training stability and focus on important structures
 - Leverages standard nnUNet preprocessing pipeline
 
+### Denormalized Prediction Export (Deep Supervision Trainer)
+
+The deep supervision trainer (`nnUNetTrainerRegression_mae_deep`) automatically exports denormalized predictions during validation:
+
+**Key features**:
+- **Automatic denormalization**: Reverses preprocessing normalization back to original intensity ranges
+- **Full trilinear interpolation**: Uses `order_z=1` for proper continuous data resampling
+- **Complete preprocessing reversal**: Handles cropping, spacing, and orientation restoration
+- **Original image space**: Predictions saved in original dimensions and coordinate system
+
+**Supported normalization schemes**:
+- `ZScoreNormalization`: Reverses z-score normalization using stored mean/std
+- `CTNormalization`: Reverses CT-specific normalization with clipping parameters
+- `NoNormalization`: No denormalization applied
+- Automatic detection from dataset preprocessing parameters
+
+**Output format**:
+- Saved as continuous float32 NIfTI files (`.nii.gz`)
+- Located in `{output_folder}/validation/` during training validation
+- Predictions maintain original CT intensity ranges (e.g., -1000 to 3000 HU)
+- Proper affine matrices for spatial coordinate mapping
+
 ### Training Configuration
 
 #### Base Trainer (`nnUNetTrainerRegression_mae`)
@@ -164,6 +201,8 @@ The regression data loaders use foreground-based cropping guided by the field-of
 - **Deep supervision**: Enabled with linear interpolation downsampling
 - **Multi-scale weighting**: Exponential decay (1.0, 0.5, 0.25, 0.125, ...)
 - **Target downsampling**: Manual in-training downsampling with trilinear/bilinear interpolation
+- **Interpolation**: Full trilinear interpolation for continuous data (order_z=1)
+- **Prediction export**: Automatic denormalization and preprocessing reversal
 - **Data augmentation**: Disabled (uses validation transforms)
 - **Mirroring**: Disabled for consistent translation
 
@@ -208,12 +247,70 @@ dependencies = [
 
 ## Validation and Metrics
 
-The trainer logs validation MAE loss for monitoring training progress. Additional metrics can be computed post-training:
+The regression trainers provide comprehensive validation metrics for evaluating translation quality. Both trainers automatically compute and save detailed metrics during validation.
 
-- **PSNR**: Peak Signal-to-Noise Ratio
-- **SSIM**: Structural Similarity Index
-- **MAE/MSE**: Mean Absolute/Squared Error
-- **HU accuracy**: For CT translation tasks
+### Online Metrics (During Training)
+- **Validation MAE loss**: Monitored every epoch for training progress
+
+### Automatic Validation Metrics 
+Both regression trainers now automatically compute comprehensive metrics during validation:
+
+- **MAE (Mean Absolute Error)**: Mean absolute difference between predicted and ground truth values
+- **PSNR (Peak Signal-to-Noise Ratio)**: Image quality metric in decibels (higher is better)  
+- **SSIM (Structural Similarity Index)**: Measures structural similarity between images (0-1, higher is better)
+- **MSE/RMSE**: Mean Squared Error and Root Mean Squared Error for reference
+
+**Automatic computation features**:
+- Metrics computed on **denormalized predictions** in original intensity ranges (e.g., CT Hounsfield Units)
+- Results saved as `validation_summary.json` in each fold's validation folder
+- Per-case metrics and summary statistics included
+- Multiprocessing support for efficient computation
+- Compatible with both 2D and 3D data
+
+### Validation Summary JSON Structure
+```json
+{
+  "metric_per_case": [
+    {
+      "reference_file": "/path/to/gt/case_001.nii.gz",
+      "prediction_file": "/path/to/pred/case_001.nii.gz", 
+      "MAE": 45.23,
+      "PSNR": 28.15,
+      "SSIM": 0.85,
+      "MSE": 2156.7,
+      "RMSE": 46.44
+    }
+  ],
+  "mean": {
+    "MAE": 42.18,
+    "PSNR": 29.34,
+    "SSIM": 0.87,
+    "MSE": 2045.3, 
+    "RMSE": 45.22
+  },
+  "num_cases": 25,
+  "valid_cases": {
+    "MAE": 25,
+    "PSNR": 25,
+    "SSIM": 25,
+    "MSE": 25,
+    "RMSE": 25
+  }
+}
+```
+
+### Cross-Validation Results
+The cross-validation accumulation system automatically detects regression trainers and:
+- Computes combined metrics across all folds  
+- Uses ground truth images (not segmentation labels) for comparison
+- Saves comprehensive summary statistics for the entire cross-validation
+
+### Denormalized Prediction Export
+Both regression trainers automatically save denormalized predictions during validation:
+- **Location**: `{output_folder}/validation/`
+- **Format**: Float32 NIfTI files with original intensity ranges
+- **Timing**: Generated during final validation or when using `--val` flag
+- **Quality**: Ready for direct comparison with ground truth images
 
 ## Troubleshooting
 
@@ -223,6 +320,13 @@ The trainer logs validation MAE loss for monitoring training progress. Additiona
 2. **Memory issues**: Reduce batch size or patch size
 3. **Channel mismatch**: Verify dataset has exactly 2 channels (source + target)
 4. **Preprocessing errors**: Check that both channels have valid intensity properties
+5. **Denormalization issues**: Check normalization scheme in plans.json matches expected type
+6. **Prediction export failures**: Verify output folder permissions and disk space
+7. **Metrics computation failures**: 
+   - Ensure scikit-image is installed for PSNR/SSIM computation
+   - Check that ground truth folder exists and contains matching files
+   - Verify file formats are compatible (same extensions, readable by SimpleITK)
+8. **Ground truth folder not found**: Check that `imagesTr` folder exists with ground truth images (channel 1 contains target data)
 
 ### Debugging
 
@@ -231,6 +335,11 @@ Enable verbose logging to monitor:
 - Loss computation
 - Data loader behavior
 - Memory usage
+- Denormalization parameters and applied schemes
+- Prediction export progress and final intensity ranges
+- Preprocessing reversal steps (resampling, cropping, transpose)
+- **Metrics computation**: Ground truth folder detection, file matching, and metric calculation progress
+- **Validation summary creation**: JSON file generation and content verification
 
 ## Example Use Cases
 
