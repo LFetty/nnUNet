@@ -17,8 +17,65 @@ from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 
 try:
     from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+    from skimage.util import crop
 except ImportError:
     raise ImportError("scikit-image is required for PSNR and SSIM computation. Install with: pip install scikit-image")
+
+try:
+    import SimpleITK as sitk
+except ImportError:
+    raise ImportError("SimpleITK is required for mask generation. Install with: pip install SimpleITK")
+
+
+def generate_mask(input_image_path: str, label_file_path: str = None):
+    """
+    Generate binary mask from CT image using Otsu thresholding and morphological operations.
+    Based on challenge reference implementation.
+
+    Args:
+        input_image_path: Path to CT ground truth image
+        label_file_path: Path to label file to exclude voxels outside FOV (optional)
+
+    Returns:
+        SimpleITK binary mask image
+    """
+    # Load image and invert intensity
+    image = sitk.InvertIntensity(sitk.Cast(sitk.ReadImage(input_image_path), sitk.sitkFloat32))
+
+    # Apply Otsu thresholding
+    mask = sitk.OtsuThreshold(image)
+
+    # Binary dilate with (10, 10, 1)
+    dil_mask = sitk.BinaryDilate(mask, (10, 10, 1))
+
+    # Connected component analysis
+    component_image = sitk.ConnectedComponent(dil_mask)
+
+    # Sort components by size and keep largest
+    sorted_component_image = sitk.RelabelComponent(component_image, sortByObjectSize=True)
+    largest_component_binary_image = sorted_component_image == 1
+
+    # Morphological closing with (12, 12, 12)
+    mask_closed = sitk.BinaryMorphologicalClosing(largest_component_binary_image, (12, 12, 12))
+
+    # Binary dilate with (10, 10, 0)
+    dilated_mask = sitk.BinaryDilate(mask_closed, (10, 10, 0))
+
+    # Fill holes
+    filled_mask = sitk.BinaryFillhole(dilated_mask)
+
+    # Exclude voxels outside FOV using label file
+    if label_file_path is not None and isfile(label_file_path):
+        # Load label file
+        label_image = sitk.ReadImage(label_file_path)
+
+        # Create FOV mask (any voxel with label > 0 is inside FOV)
+        fov_mask = label_image > 0
+
+        # Apply boolean AND to exclude voxels outside FOV
+        filled_mask = filled_mask & fov_mask
+
+    return filled_mask
 
 
 def save_regression_summary_json(results: dict, output_file: str):
@@ -38,15 +95,19 @@ def load_regression_summary_json(filename: str):
     return load_json(filename)
 
 
-def compute_regression_metrics(reference_file: str, prediction_file: str, image_reader_writer: BaseReaderWriter) -> dict:
+def compute_regression_metrics(reference_file: str, prediction_file: str, image_reader_writer: BaseReaderWriter,
+                               mask_file: str = None, save_mask_path: str = None, label_file: str = None) -> dict:
     """
     Compute regression metrics (MAE, PSNR, SSIM) between reference and prediction images
-    
+
     Args:
         reference_file: Path to ground truth image
-        prediction_file: Path to predicted image  
+        prediction_file: Path to predicted image
         image_reader_writer: Reader/writer for loading images
-    
+        mask_file: Path to pre-computed mask file (optional, will generate if None)
+        save_mask_path: Full path to save generated mask (optional)
+        label_file: Path to label file for FOV masking (optional)
+
     Returns:
         Dictionary with computed metrics
     """
@@ -61,82 +122,103 @@ def compute_regression_metrics(reference_file: str, prediction_file: str, image_
         # Fallback to segmentation reader if image reader fails
         ref_image, ref_dict = image_reader_writer.read_seg(reference_file)
         pred_image, pred_dict = image_reader_writer.read_seg(prediction_file)
-    
+
     # Ensure images have the same shape
     if ref_image.shape != pred_image.shape:
         raise ValueError(f"Shape mismatch: reference {ref_image.shape} vs prediction {pred_image.shape}")
-    
+
     # Convert to float32 for computation
     ref_image = ref_image.astype(np.float32)
     pred_image = pred_image.astype(np.float32)
+
+    # Generate or load mask
+    if mask_file is None:
+        # Generate mask from reference image with optional label file for FOV masking
+        mask_sitk = generate_mask(reference_file, label_file_path=label_file)
+
+        # Save mask if path is provided
+        if save_mask_path is not None:
+            sitk.WriteImage(mask_sitk, save_mask_path)
+    else:
+        # Load pre-computed mask
+        mask_sitk = sitk.ReadImage(mask_file)
+
+    # Convert mask to numpy array
+    mask_array = sitk.GetArrayFromImage(mask_sitk).astype(bool)
+
+    # Apply mask to images - only compute metrics on masked voxels
+    ref_image_masked = ref_image[mask_array]
+    pred_image_masked = pred_image[mask_array]
     
     # Compute metrics
     results = {}
     results['reference_file'] = reference_file
     results['prediction_file'] = prediction_file
-    
-    # Mean Absolute Error
-    mae = np.mean(np.abs(ref_image - pred_image))
+
+    # Fixed dynamic range for CT images
+    dynamic_range = (-1024, 3071)
+    data_range = dynamic_range[1] - dynamic_range[0]
+
+    # Mean Absolute Error (on masked voxels only)
+    mae = np.mean(np.abs(ref_image_masked - pred_image_masked))
     results['MAE'] = float(mae)
-    
-    # Mean Squared Error (for reference)
-    mse = np.mean((ref_image - pred_image) ** 2)
+
+    # Mean Squared Error (on masked voxels only)
+    mse = np.mean((ref_image_masked - pred_image_masked) ** 2)
     results['MSE'] = float(mse)
-    
+
     # Root Mean Squared Error
     rmse = np.sqrt(mse)
     results['RMSE'] = float(rmse)
-    
-    # Peak Signal-to-Noise Ratio
-    # For medical images, use the full data range
-    data_range = ref_image.max() - ref_image.min()
-    if data_range > 0:
-        try:
-            psnr = peak_signal_noise_ratio(ref_image, pred_image, data_range=data_range)
-            results['PSNR'] = float(psnr)
-        except:
-            # Fallback if PSNR computation fails
-            results['PSNR'] = np.nan
-    else:
+
+    # Peak Signal-to-Noise Ratio (on masked voxels only)
+    try:
+        psnr = peak_signal_noise_ratio(ref_image_masked, pred_image_masked, data_range=data_range)
+        results['PSNR'] = float(psnr)
+    except:
+        # Fallback if PSNR computation fails
         results['PSNR'] = np.nan
     
-    # Structural Similarity Index Measure
+    # Structural Similarity Index Measure (following challenge reference implementation)
     try:
-        # For 3D data, we need to specify which axes to compute SSIM over
-        if ref_image.ndim == 3:
-            # Compute SSIM slice by slice and take the mean
-            ssim_scores = []
-            for i in range(ref_image.shape[0]):
-                slice_ref = ref_image[i]
-                slice_pred = pred_image[i]
-                if slice_ref.std() > 0 and slice_pred.std() > 0:  # Only compute if there's variation
-                    ssim_slice = structural_similarity(
-                        slice_ref, slice_pred, 
-                        data_range=data_range,
-                        gaussian_weights=True,
-                        use_sample_covariance=False
-                    )
-                    ssim_scores.append(ssim_slice)
-            
-            if ssim_scores:
-                ssim = np.mean(ssim_scores)
-            else:
-                ssim = np.nan
+        # Clip images to dynamic range
+        ref_image_clipped = np.clip(ref_image, dynamic_range[0], dynamic_range[1])
+        pred_image_clipped = np.clip(pred_image, dynamic_range[0], dynamic_range[1])
+
+        # Binarize mask
+        mask_binary = np.where(mask_array > 0, 1.0, 0.0)
+
+        # Mask the images: set non-masked regions to min value
+        ref_image_masked_ssim = np.where(mask_binary == 0, dynamic_range[0], ref_image_clipped)
+        pred_image_masked_ssim = np.where(mask_binary == 0, dynamic_range[0], pred_image_clipped)
+
+        # Make values non-negative (shift by minimum value)
+        if dynamic_range[0] < 0:
+            ref_image_masked_ssim = ref_image_masked_ssim - dynamic_range[0]
+            pred_image_masked_ssim = pred_image_masked_ssim - dynamic_range[0]
+
+        # Compute SSIM on full 3D volume with full output to get ssim_map
+        ssim_value_full, ssim_map = structural_similarity(
+            ref_image_masked_ssim, pred_image_masked_ssim,
+            data_range=data_range,
+            full=True
+        )
+
+        # Crop both ssim_map and mask with pad=3 (default in skimage)
+        pad = 3
+        ssim_map_cropped = crop(ssim_map, pad)
+        mask_cropped = crop(mask_binary, pad).astype(bool)
+
+        # Compute mean SSIM only on masked regions
+        if mask_cropped.sum() > 0:
+            ssim = ssim_map_cropped[mask_cropped].mean(dtype=np.float64)
         else:
-            # 2D case
-            if ref_image.std() > 0 and pred_image.std() > 0:
-                ssim = structural_similarity(
-                    ref_image, pred_image,
-                    data_range=data_range,
-                    gaussian_weights=True,
-                    use_sample_covariance=False
-                )
-            else:
-                ssim = np.nan
-        
+            ssim = np.nan
+
         results['SSIM'] = float(ssim)
-    except:
+    except Exception as e:
         # Fallback if SSIM computation fails
+        print(f"SSIM computation failed: {e}")
         results['SSIM'] = np.nan
     
     return results
@@ -146,10 +228,11 @@ def compute_regression_metrics_on_folder(folder_ref: str, folder_pred: str, outp
                                         image_reader_writer: BaseReaderWriter,
                                         file_ending: str,
                                         num_processes: int = default_num_processes,
-                                        chill: bool = True) -> dict:
+                                        chill: bool = True,
+                                        save_masks: bool = True) -> dict:
     """
     Compute regression metrics on all files in folders
-    
+
     Args:
         folder_ref: Folder with reference/ground truth images
         folder_pred: Folder with predicted images
@@ -158,7 +241,8 @@ def compute_regression_metrics_on_folder(folder_ref: str, folder_pred: str, outp
         file_ending: File extension to process
         num_processes: Number of parallel processes
         chill: If False, require all ref files to exist in pred folder
-        
+        save_masks: If True, save generated masks to validation_mask folder
+
     Returns:
         Dictionary with per-case and summary metrics
     """
@@ -223,12 +307,50 @@ def compute_regression_metrics_on_folder(folder_ref: str, folder_pred: str, outp
                 continue
 
         files_ref_full.append(gt_file)
-    
+
+    # Find label files for FOV masking
+    # Label folder is parallel to imagesTr folder (e.g., Dataset001/labelsTr)
+    label_files = []
+    folder_ref_parent = os.path.dirname(folder_ref)
+    label_folder = join(folder_ref_parent, 'labelsTr')
+
+    if os.path.isdir(label_folder):
+        print(f"Found label folder for FOV masking: {label_folder}")
+        for pred_file in files_pred:
+            case_id = pred_file.replace(file_ending, '')
+            label_file = join(label_folder, f"{case_id}{file_ending}")
+
+            if isfile(label_file):
+                label_files.append(label_file)
+            else:
+                print(f"Warning: Label file not found for {case_id}, will use mask without FOV filtering")
+                label_files.append(None)
+    else:
+        print(f"Label folder not found: {label_folder}. Masks will be generated without FOV filtering.")
+        label_files = [None] * len(files_pred)
+
+    # Prepare mask save paths if masks should be saved
+    mask_save_paths = []
+    if save_masks:
+        # Create validation_mask folder next to validation folder
+        mask_folder = folder_pred.rstrip('/').rstrip('\\') + '_mask'
+        from batchgenerators.utilities.file_and_folder_operations import maybe_mkdir_p
+        maybe_mkdir_p(mask_folder)
+
+        for pred_file in files_pred:
+            mask_save_path = join(mask_folder, pred_file)
+            mask_save_paths.append(mask_save_path)
+    else:
+        mask_save_paths = [None] * len(files_pred)
+
     # Compute metrics for each case
     with multiprocessing.get_context("spawn").Pool(num_processes) as pool:
         results = pool.starmap(
             compute_regression_metrics,
-            list(zip(files_ref_full, files_pred_full, [image_reader_writer] * len(files_pred)))
+            list(zip(files_ref_full, files_pred_full, [image_reader_writer] * len(files_pred),
+                     [None] * len(files_pred),  # mask_file (None = generate)
+                     mask_save_paths,  # save_mask_path
+                     label_files))  # label_file for FOV masking
         )
     
     # Compute summary statistics
