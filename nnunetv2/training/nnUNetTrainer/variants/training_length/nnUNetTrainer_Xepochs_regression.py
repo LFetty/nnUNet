@@ -8,7 +8,7 @@ class nnUNetTrainerRegression_20epochs(nnUNetTrainerRegression_mae_deep):
                  device: torch.device = torch.device('cuda')):
         """used for debugging plans etc"""
         super().__init__(plans, configuration, fold, dataset_json, device)
-        self.num_epochs = 200
+        self.num_epochs = 50
         self.initial_lr = 1e-3
 
 
