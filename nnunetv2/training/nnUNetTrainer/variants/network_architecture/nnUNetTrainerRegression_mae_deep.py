@@ -62,6 +62,8 @@ class nnUNetTrainerRegression_mae_deep(nnUNetTrainerRegression_mae):
         
         # Re-initialize loss with deep supervision wrapper
         self.loss = self._build_loss()
+        if isinstance(self.loss, torch.nn.Module):
+            self.loss.to(self.device)
 
     def initialize(self):
         """
@@ -242,8 +244,7 @@ class nnUNetTrainerRegression_mae_deep(nnUNetTrainerRegression_mae):
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
             output = self.network(input_data)
             del input_data
-            
-            # Handle deep supervision by manually downsampling target
+
             if self.enable_deep_supervision:
                 target_scales = self._downsample_target_for_ds(target_data)
                 l = self.loss(output, target_scales)

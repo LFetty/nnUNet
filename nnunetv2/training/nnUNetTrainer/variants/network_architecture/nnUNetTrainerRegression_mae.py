@@ -46,8 +46,10 @@ class nnUNetTrainerRegression_mae(nnUNetTrainer):
         self.num_iterations_per_epoch = 250
         self.num_epochs = 1000
         
-        # Initialize MAE loss
-        self.loss = self._build_loss()
+        # Initialize MAE loss — only when this is the concrete class, not a subclass
+        # that will call _build_loss() itself after configuring deep supervision.
+        if type(self) is nnUNetTrainerRegression_mae:
+            self.loss = self._build_loss()
         
         # Parse command line arguments for trilinear support
         self.decoder_type = "standard"  # default
