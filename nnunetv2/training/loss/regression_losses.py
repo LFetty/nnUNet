@@ -25,9 +25,11 @@ class GradientLoss3D(nn.Module):
     Penalises differences in edge structure between prediction and target,
     complementing the pixel-wise MAE loss with a sharpness term.
 
-    The 3D Sobel kernel for direction d is the outer product of the smoothing
-    kernel [1, 2, 1] along the other two axes and the difference kernel [-1, 0, 1]
-    along d, normalised so values lie in [-1, 1].
+    Each Sobel kernel is the outer product of the centred difference kernel
+    [-1, 0, 1] along the axis of interest and the smoothing kernel [1, 2, 1]
+    along the two orthogonal axes, normalised by 32 so values lie in [-1, 1].
+    All three kernels are stacked into a single (3, 1, 3, 3, 3) weight so the
+    three gradient directions are computed in one F.conv3d call.
     """
 
     def __init__(self):
@@ -35,26 +37,19 @@ class GradientLoss3D(nn.Module):
         smooth = torch.tensor([1.0, 2.0, 1.0])
         diff = torch.tensor([-1.0, 0.0, 1.0])
 
-        # Outer products: (3, 3, 3) Sobel kernels for each spatial axis.
-        # Axes are (D, H, W). Normalisation factor = 4 * 4 * 2 = 32.
-        kx = torch.einsum("i,j,k->ijk", smooth, smooth, diff) / 32.0  # differentiates along W
-        ky = torch.einsum("i,j,k->ijk", smooth, diff, smooth) / 32.0  # differentiates along H
-        kz = torch.einsum("i,j,k->ijk", diff, smooth, smooth) / 32.0  # differentiates along D
+        # (3, 3, 3) Sobel kernels; normalisation factor = 4 * 4 * 2 = 32.
+        kx = torch.einsum("i,j,k->ijk", smooth, smooth, diff) / 32.0  # ∂/∂W
+        ky = torch.einsum("i,j,k->ijk", smooth, diff, smooth) / 32.0  # ∂/∂H
+        kz = torch.einsum("i,j,k->ijk", diff, smooth, smooth) / 32.0  # ∂/∂D
 
-        # Shape for F.conv3d weight: (out_ch, in_ch/groups, kD, kH, kW)
-        self.register_buffer("kx", kx[None, None])
-        self.register_buffer("ky", ky[None, None])
-        self.register_buffer("kz", kz[None, None])
+        # Stack into (3, 1, 3, 3, 3): one conv3d call produces all three gradients.
+        self.register_buffer("kernels", torch.stack([kx, ky, kz]).unsqueeze(1))
 
     def _gradient_magnitude(self, x: torch.Tensor) -> torch.Tensor:
         """Compute |∇x| via 3D Sobel; input shape (B, 1, D, H, W)."""
-        kx = self.kx.to(x)
-        ky = self.ky.to(x)
-        kz = self.kz.to(x)
-        gx = F.conv3d(x, kx, padding=1)
-        gy = F.conv3d(x, ky, padding=1)
-        gz = F.conv3d(x, kz, padding=1)
-        return (gx ** 2 + gy ** 2 + gz ** 2 + 1e-6).sqrt()
+        # Output: (B, 3, D, H, W) — channels are gx, gy, gz
+        grads = F.conv3d(x, self.kernels.to(x), padding=1)
+        return (grads.pow(2).sum(dim=1, keepdim=True) + 1e-6).sqrt()
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
@@ -122,6 +117,7 @@ class MedicalPerceptualLoss(nn.Module):
         self.feature_net.eval()
         for p in self.feature_net.parameters():
             p.requires_grad_(False)
+        self.feature_net = torch.compile(self.feature_net)
 
         self.n_slices = n_slices
         self.weight = weight
@@ -307,18 +303,21 @@ class RegressionCompoundLoss(nn.Module):
 
 class PerceptualHighestResolutionLossWrapper(nn.Module):
     """
-    Adds a perceptual term (highest resolution only) on top of any base loss.
+    Adds full-resolution-only terms (gradient + perceptual) on top of any base loss.
 
-    ``base_loss`` handles all scales (e.g. a ``DeepSupervisionWrapper`` during
-    training, or a plain loss during validation).  This wrapper only adds the
-    perceptual term for the highest-resolution output (index 0 when pred is a
-    list, or pred itself when it is a plain tensor).
+    ``base_loss`` handles all deep-supervision scales.  This wrapper applies the
+    gradient and perceptual losses only to the highest-resolution output (index 0
+    when pred is a list, or pred itself when it is a plain tensor).
+
+    Keeping gradient loss here (rather than inside DeepSupervisionWrapper) avoids
+    penalising sharpness on blurry downsampled targets at lower DS scales.
 
     Args:
-        base_loss:         Loss applied to all outputs (caller is responsible for
-                           wrapping with ``DeepSupervisionWrapper`` if needed).
-        perceptual_loss:   Frozen feature-space loss applied only at full resolution.
+        base_loss:         Loss applied to all outputs (e.g. DeepSupervisionWrapper).
+        perceptual_loss:   Frozen feature-space loss, full resolution only.
         perceptual_weight: Scalar multiplier for the perceptual term.
+        gradient_loss:     Optional GradientLoss3D, full resolution only.
+        gradient_weight:   Scalar multiplier for the gradient term.
     """
 
     def __init__(
@@ -326,18 +325,26 @@ class PerceptualHighestResolutionLossWrapper(nn.Module):
         base_loss: nn.Module,
         perceptual_loss: Optional[MedicalPerceptualLoss] = None,
         perceptual_weight: float = 0.0,
+        gradient_loss: Optional[GradientLoss3D] = None,
+        gradient_weight: float = 0.0,
     ):
         super().__init__()
         self.base_loss = base_loss
         self.perceptual_loss = perceptual_loss
         self.perceptual_weight = perceptual_weight
+        self.gradient_loss = gradient_loss
+        self.gradient_weight = gradient_weight
 
     def forward(self, pred, target) -> torch.Tensor:
         loss = self.base_loss(pred, target)
 
+        pred_hr = pred[0] if isinstance(pred, (tuple, list)) else pred
+        target_hr = target[0] if isinstance(target, (tuple, list)) else target
+
+        if self.gradient_loss is not None and self.gradient_weight > 0:
+            loss = loss + self.gradient_weight * self.gradient_loss(pred_hr, target_hr)
+
         if self.perceptual_loss is not None and self.perceptual_weight > 0:
-            pred_hr = pred[0] if isinstance(pred, (tuple, list)) else pred
-            target_hr = target[0] if isinstance(target, (tuple, list)) else target
             loss = loss + self.perceptual_weight * self.perceptual_loss(pred_hr, target_hr)
 
         return loss

@@ -23,6 +23,7 @@ import numpy as np
 
 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
 from nnunetv2.training.loss.regression_losses import (
+    GradientLoss3D,
     MedicalPerceptualLoss,
     PerceptualHighestResolutionLossWrapper,
     RegressionCompoundLoss,
@@ -59,9 +60,13 @@ class nnUNetTrainerRegression_advanced(nnUNetTrainerRegression_mae_deep):
 
     def _build_loss(self):
         """
-        Build ``PerceptualHighestResolutionLossWrapper`` around
-        ``RegressionCompoundLoss`` (MAE + gradient, no perceptual at
-        per-scale level).
+        Build ``PerceptualHighestResolutionLossWrapper`` around a MAE-only
+        ``DeepSupervisionWrapper``.
+
+        Gradient loss is intentionally kept outside deep supervision: lower-DS
+        targets are blurry downsampled versions where Sobel gradients carry no
+        useful sharpness signal.  Both gradient and perceptual terms are applied
+        only to the highest-resolution output.
         """
         normalization_schemes = self.configuration_manager.normalization_schemes
         intensity_props = self.plans_manager.foreground_intensity_properties_per_channel
@@ -71,12 +76,15 @@ class nnUNetTrainerRegression_advanced(nnUNetTrainerRegression_mae_deep):
         target_mean = float(target_props.get('mean', 0.0))
         target_std = float(target_props.get('std', 1.0))
 
-        # Per-scale base loss: MAE + gradient (no perceptual — applied separately)
+        # Per-scale base loss: MAE only — gradient applied at HR only
         base_loss = RegressionCompoundLoss(
             w_mae=self.w_mae,
-            w_grad=self.w_grad,
+            w_grad=0.0,
             w_perc=0.0,
         )
+
+        # Gradient loss (full-resolution only)
+        grad_loss: Optional["GradientLoss3D"] = GradientLoss3D() if self.w_grad > 0 else None
 
         # Perceptual loss (full-resolution only)
         perc_loss: Optional["MedicalPerceptualLoss"] = None
@@ -97,6 +105,8 @@ class nnUNetTrainerRegression_advanced(nnUNetTrainerRegression_mae_deep):
 
         return PerceptualHighestResolutionLossWrapper(
             base_loss=ds_loss,
+            gradient_loss=grad_loss,
+            gradient_weight=self.w_grad,
             perceptual_loss=perc_loss,
             perceptual_weight=self.w_perc,
         )
@@ -127,3 +137,22 @@ class nnUNetTrainerRegression_advanced_perceptual(nnUNetTrainerRegression_advanc
 class nnUNetTrainerRegression_advanced_perceptual_strongGrad(nnUNetTrainerRegression_advanced_perceptual):
     """Perceptual + stronger gradient sharpening: w_grad = 0.5."""
     w_grad: float = 0.5
+
+
+class nnUNetTrainerRegression_advanced_perceptual_spatial(nnUNetTrainerRegression_advanced):
+    """
+    MAE (DS) + gradient loss (HR only) + spatial multi-layer perceptual loss (HR only).
+
+    Improvements over ``nnUNetTrainerRegression_advanced_perceptual``:
+      - Gradient loss moved out of deep supervision — applied only at full resolution
+        to avoid penalising sharpness on blurry downsampled DS targets.
+      - Perceptual model uses spatial patch tokens (no mean pooling) from three
+        intermediate ViT layers (4, 8, 12), giving richer structural comparison
+        instead of a single global embedding.
+      - Higher perceptual weight (0.05) and more slices (16) for a stronger,
+        lower-variance gradient signal per training step.
+    """
+    w_perc: float = 0.05
+    w_grad: float = 0.1
+    perceptual_model_path: str = str(Path(__file__).parents[5] / "perceptual_model_spatial_multilayer.pt")
+    perceptual_n_slices: int = 16

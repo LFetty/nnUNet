@@ -5,8 +5,9 @@ This script contains the MedDiNOv3 checkpoint conversion and loading logic
 directly so it does not depend on any external helper file. It traces a wrapper
 that:
 1. loads the Hugging Face-style MedDiNOv3 backbone,
-2. captures one or more intermediate layer activations with forward hooks,
-3. pools each captured feature to a per-sample embedding,
+2. extracts intermediate hidden-state features via output_hidden_states=True,
+3. optionally pools each feature to a per-sample embedding, or
+   returns raw patch tokens (spatial mode, --no-pool) for structural comparison,
 4. returns either a single feature tensor or a tuple of feature tensors.
 
 The traced model is intended to be consumed by
@@ -86,32 +87,32 @@ def convert_state_dict(state_dict: dict) -> dict:
                 suffix = rest.replace("attn.qkv", "")
                 if suffix == ".weight":
                     q, k, v = value.chunk(3, dim=0)
-                    new_state_dict[f"layer.{layer_idx}.attention.q_proj.weight"] = q
-                    new_state_dict[f"layer.{layer_idx}.attention.k_proj.weight"] = k
-                    new_state_dict[f"layer.{layer_idx}.attention.v_proj.weight"] = v
+                    new_state_dict[f"model.layer.{layer_idx}.attention.q_proj.weight"] = q
+                    new_state_dict[f"model.layer.{layer_idx}.attention.k_proj.weight"] = k
+                    new_state_dict[f"model.layer.{layer_idx}.attention.v_proj.weight"] = v
                     continue
                 if suffix == ".bias":
                     q, k, v = value.chunk(3, dim=0)
-                    new_state_dict[f"layer.{layer_idx}.attention.q_proj.bias"] = q
-                    new_state_dict[f"layer.{layer_idx}.attention.k_proj.bias"] = k
-                    new_state_dict[f"layer.{layer_idx}.attention.v_proj.bias"] = v
+                    new_state_dict[f"model.layer.{layer_idx}.attention.q_proj.bias"] = q
+                    new_state_dict[f"model.layer.{layer_idx}.attention.k_proj.bias"] = k
+                    new_state_dict[f"model.layer.{layer_idx}.attention.v_proj.bias"] = v
                     continue
             elif rest.startswith("attn.proj"):
-                new_key = f"layer.{layer_idx}.attention.o_proj{rest.replace('attn.proj', '')}"
+                new_key = f"model.layer.{layer_idx}.attention.o_proj{rest.replace('attn.proj', '')}"
             elif rest.startswith("norm1"):
-                new_key = f"layer.{layer_idx}.norm1{rest.replace('norm1', '')}"
+                new_key = f"model.layer.{layer_idx}.norm1{rest.replace('norm1', '')}"
             elif rest.startswith("norm2"):
-                new_key = f"layer.{layer_idx}.norm2{rest.replace('norm2', '')}"
+                new_key = f"model.layer.{layer_idx}.norm2{rest.replace('norm2', '')}"
             elif rest == "ls1.gamma":
-                new_key = f"layer.{layer_idx}.layer_scale1.lambda1"
+                new_key = f"model.layer.{layer_idx}.layer_scale1.lambda1"
             elif rest == "ls2.gamma":
-                new_key = f"layer.{layer_idx}.layer_scale2.lambda1"
+                new_key = f"model.layer.{layer_idx}.layer_scale2.lambda1"
             elif rest.startswith("mlp.fc1"):
-                new_key = f"layer.{layer_idx}.mlp.up_proj{rest.replace('mlp.fc1', '')}"
+                new_key = f"model.layer.{layer_idx}.mlp.up_proj{rest.replace('mlp.fc1', '')}"
             elif rest.startswith("mlp.fc2"):
-                new_key = f"layer.{layer_idx}.mlp.down_proj{rest.replace('mlp.fc2', '')}"
+                new_key = f"model.layer.{layer_idx}.mlp.down_proj{rest.replace('mlp.fc2', '')}"
             else:
-                new_key = f"layer.{layer_idx}.{rest}"
+                new_key = f"model.layer.{layer_idx}.{rest}"
 
         if new_key == "embeddings.mask_token":
             value = value.unsqueeze(0)
@@ -175,38 +176,40 @@ def load_meddinov3_transformers(
 
 
 class _MedDiNOv3FeatureWrapper(torch.nn.Module):
-    def __init__(self, backbone: torch.nn.Module, feature_layers: Optional[List[str]] = None):
+    """Wrapper around a DINOv3 ViT backbone that extracts intermediate hidden
+    state features suitable for perceptual loss computation.
+
+    Two extraction modes controlled by *pool*:
+      - pool=True  (default): mean-pool token dim -> (B, C) per layer.
+      - pool=False (spatial): strip CLS/register prefix tokens and return the
+        raw patch token grid -> (B, num_patches, C) per layer.
+
+    Instead of using forward hooks (which torch.jit.trace cannot capture),
+    this wrapper sets ``output_hidden_states=True`` on the backbone config
+    and indexes ``outputs.hidden_states`` directly.
+
+    Hidden-state indices follow HuggingFace convention:
+      0 = embedding output, 1..N = after transformer layer 1..N.
+    So ``layer_indices=[4, 8, 12]`` captures the output of layers 4, 8, 12.
+    """
+
+    def __init__(
+        self,
+        backbone: torch.nn.Module,
+        layer_indices: Optional[List[int]] = None,
+        pool: bool = True,
+        num_prefix_tokens: int = 5,
+    ):
         super().__init__()
         self.backbone = backbone
-        self.feature_layers = list(feature_layers) if feature_layers is not None else []
-        self._features: Dict[str, torch.Tensor] = {}
-
-        self._handles = []
-        if len(self.feature_layers) > 0:
-            named_modules = dict(self.backbone.named_modules())
-            missing = [name for name in self.feature_layers if name not in named_modules]
-            if len(missing) > 0:
-                available = list(named_modules.keys())
-                preview = ", ".join(available[:50])
-                raise ValueError(
-                    "The following feature layers were not found in the model: "
-                    f"{missing}. Available module names include: {preview}"
-                )
-
-            for name in self.feature_layers:
-                self._handles.append(named_modules[name].register_forward_hook(self._make_hook(name)))
-
-    def _make_hook(self, name: str):
-        def hook(_module, _inputs, output):
-            if isinstance(output, (list, tuple)):
-                tensor_outputs = [o for o in output if isinstance(o, torch.Tensor)]
-                if len(tensor_outputs) == 0:
-                    raise TypeError(f"Layer '{name}' produced no tensor output.")
-                output = tensor_outputs[0]
-            if not isinstance(output, torch.Tensor):
-                raise TypeError(f"Layer '{name}' produced unsupported output type: {type(output)}")
-            self._features[name] = output
-        return hook
+        # Ensure backbone always returns hidden states
+        if hasattr(self.backbone, "config"):
+            self.backbone.config.output_hidden_states = True
+        self.layer_indices: List[int] = list(layer_indices) if layer_indices is not None else []
+        self.pool = pool
+        # Number of non-patch prefix tokens to strip when pool=False.
+        # DINOv3 ViT-B default: 1 CLS + 4 register = 5
+        self.num_prefix_tokens = num_prefix_tokens
 
     @staticmethod
     def _pool_feature(x: torch.Tensor) -> torch.Tensor:
@@ -219,20 +222,43 @@ class _MedDiNOv3FeatureWrapper(torch.nn.Module):
             return x.mean(dim=dims)
         raise ValueError(f"Unsupported feature tensor shape: {tuple(x.shape)}")
 
+    def _strip_prefix_tokens(self, x: torch.Tensor) -> torch.Tensor:
+        """Remove CLS and register tokens, keeping only patch tokens.
+
+        Input shape:  (B, num_prefix + num_patches, C)
+        Output shape: (B, num_patches, C)
+        """
+        if x.ndim != 3 or self.num_prefix_tokens <= 0:
+            return x
+        return x[:, self.num_prefix_tokens:, :]
+
+    def _process_feature(self, x: torch.Tensor) -> torch.Tensor:
+        """Pool or strip prefix tokens depending on self.pool setting."""
+        if self.pool:
+            return self._pool_feature(x)
+        else:
+            return self._strip_prefix_tokens(x)
+
     def forward(self, x: torch.Tensor):
-        self._features = {}
         outputs = self.backbone(x)
 
-        if len(self.feature_layers) == 0:
-            if not hasattr(outputs, "pooler_output"):
-                raise RuntimeError("MedDiNOv3 backbone output does not expose pooler_output.")
-            return outputs.pooler_output
+        # No specific layers requested -> return pooled CLS or spatial last hidden state
+        if len(self.layer_indices) == 0:
+            if self.pool:
+                return outputs.pooler_output
+            else:
+                return self._strip_prefix_tokens(outputs.last_hidden_state)
+
+        # Stack all hidden states into a single tensor so that integer
+        # indexing becomes a traceable tensor operation (torch.jit.trace
+        # cannot capture tuple indexing correctly).
+        hidden_states = outputs.hidden_states  # tuple of (B, T, C)
+        stacked = torch.stack(hidden_states, dim=0)  # (num_layers+1, B, T, C)
 
         collected = []
-        for name in self.feature_layers:
-            if name not in self._features:
-                raise RuntimeError(f"Requested feature layer '{name}' did not produce an activation.")
-            collected.append(self._pool_feature(self._features[name]))
+        for idx in self.layer_indices:
+            h = stacked[idx]  # (B, T, C)
+            collected.append(self._process_feature(h))
 
         if len(collected) == 1:
             return collected[0]
@@ -253,10 +279,33 @@ def main():
         help="Hugging Face repo id used when checkpoint is not provided.",
     )
     parser.add_argument(
+        "--layer-indices",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Hidden-state indices to extract (0=embedding, 1..N=transformer layers). "
+             "E.g. --layer-indices 4 8 12 captures outputs of layers 4, 8 and 12.",
+    )
+    parser.add_argument(
         "--feature-layers",
         nargs="+",
         default=None,
-        help="One or more module names to capture with forward hooks.",
+        help="[DEPRECATED] Module names are no longer used. Use --layer-indices instead.",
+    )
+    parser.add_argument(
+        "--no-pool",
+        action="store_true",
+        default=False,
+        help="Keep spatial patch tokens instead of mean-pooling features. "
+             "Returns (B, num_patches, 768) per layer instead of (B, 768). "
+             "CLS and register tokens are stripped automatically.",
+    )
+    parser.add_argument(
+        "--num-prefix-tokens",
+        type=int,
+        default=5,
+        help="Number of non-patch prefix tokens to strip when --no-pool is set "
+             "(default: 5 = 1 CLS + 4 register for DINOv3 ViT-B).",
     )
     parser.add_argument(
         "--input-size",
@@ -292,16 +341,43 @@ def main():
     for p in backbone.parameters():
         p.requires_grad_(False)
 
-    model = _MedDiNOv3FeatureWrapper(backbone, args.feature_layers).to(device)
+    # Handle deprecated --feature-layers
+    if args.feature_layers is not None and args.layer_indices is None:
+        print("WARNING: --feature-layers is deprecated. Converting module names to layer indices.")
+        print("  Please use --layer-indices (integers) instead.")
+        # Try to convert e.g. "model.layer.3" -> 4 (index 0=embedding, 1..12=layers)
+        indices = []
+        for name in args.feature_layers:
+            parts = name.split(".")
+            try:
+                layer_num = int(parts[-1])
+                # hidden_states[0] = embedding, hidden_states[1] = layer 0, etc.
+                indices.append(layer_num + 1)
+            except ValueError:
+                print(f"  Cannot convert '{name}' to layer index. Skipping.")
+        if indices:
+            args.layer_indices = indices
+            print(f"  Converted to --layer-indices {indices}")
+
+    model = _MedDiNOv3FeatureWrapper(
+        backbone,
+        args.layer_indices,
+        pool=not args.no_pool,
+        num_prefix_tokens=args.num_prefix_tokens,
+    ).to(device)
     model.eval()
 
     dummy = torch.zeros(1, 3, args.input_size, args.input_size, dtype=torch.float32, device=device)
 
     print(f"Tracing model with input shape {tuple(dummy.shape)} ...")
-    if args.feature_layers is None:
-        print("Capturing final pooled MedDiNOv3 output.")
+    if args.layer_indices is None:
+        if args.no_pool:
+            print("Capturing last hidden state patch tokens (spatial, no pooling).")
+        else:
+            print("Capturing final pooled MedDiNOv3 output.")
     else:
-        print(f"Capturing layers: {args.feature_layers}")
+        pool_str = "spatial (no pooling)" if args.no_pool else "pooled"
+        print(f"Capturing hidden state indices ({pool_str}): {args.layer_indices}")
 
     with torch.no_grad():
         traced = torch.jit.trace(model, dummy)
