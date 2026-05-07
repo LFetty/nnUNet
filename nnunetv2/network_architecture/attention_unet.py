@@ -11,6 +11,7 @@ Components:
 Reference: Oktay et al., "Attention U-Net: Learning Where to Look for the Pancreas", MIDL 2018
 """
 
+import math
 from typing import Union, List, Tuple, Type
 
 import numpy as np
@@ -53,8 +54,11 @@ class AttentionGate3D(nn.Module):
         )
         self.relu = nn.ReLU(inplace=True)
 
-        # Initialize psi bias negative so gates start mostly open (avoids dead-start)
-        nn.init.constant_(self.psi[0].bias, -0.1)
+        # Initialize psi bias large-positive so sigmoid ≈ 0.95 and gates start
+        # mostly open — with bias = 0 or negative the sigmoid sits near 0.5 and
+        # every skip is halved at init, making the attention UNet spend many
+        # epochs recovering from a 2× skip attenuation.
+        nn.init.constant_(self.psi[0].bias, 3.0)
 
     def forward(self, g: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         """
@@ -74,34 +78,75 @@ class AttentionGate3D(nn.Module):
 
 class SelfAttentionBottleneck3D(nn.Module):
     """
-    Multi-head self-attention (MHSA) applied at the UNet bottleneck.
+    Full transformer block at the UNet bottleneck: pre-norm MHSA + pre-norm FFN,
+    with 3D sinusoidal positional encoding injected once before the first sublayer.
 
-    Flattens the 3D spatial dimensions into a sequence of tokens, applies
-    MHSA with a residual connection, then reshapes back. Memory cost is
-    O(N^2 * C) where N = D*H*W at the bottleneck — typically 8–64 tokens
-    at nnUNet's default bottleneck resolution.
+    The encoding splits channels evenly across D, H, W so each spatial axis gets
+    its own frequency bands rather than a single flat 1D sequence.
 
     Args:
         channels: Number of feature channels at the bottleneck.
-        num_heads: Number of attention heads (adjusted down if channels not divisible).
-        dropout: Attention dropout probability.
+        num_heads: Number of attention heads (adjusted down if not divisible).
+        dropout: Dropout probability for attention weights and FFN activations.
+        ffn_expansion: Hidden-dim multiplier for the FFN (default 4, as in ViT).
     """
 
-    def __init__(self, channels: int, num_heads: int = 8, dropout: float = 0.0):
+    def __init__(self, channels: int, num_heads: int = 8, dropout: float = 0.0, ffn_expansion: int = 4):
         super().__init__()
-        # Halve num_heads until channels is divisible
         while num_heads > 1 and channels % num_heads != 0:
             num_heads //= 2
-        self.norm = nn.LayerNorm(channels)
+        self.norm1 = nn.LayerNorm(channels)
+        self.norm2 = nn.LayerNorm(channels)
         self.attn = nn.MultiheadAttention(channels, num_heads, dropout=dropout, batch_first=True)
+        ffn_hidden = channels * ffn_expansion
+        self.ffn = nn.Sequential(
+            nn.Linear(channels, ffn_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_hidden, channels),
+            nn.Dropout(dropout),
+        )
+
+    @staticmethod
+    def _sincos_3d(D: int, H: int, W: int, C: int, device: torch.device) -> torch.Tensor:
+        """Returns [1, D*H*W, C] sinusoidal positional encoding."""
+        C_d = C // 3
+        C_h = C // 3
+        C_w = C - C_d - C_h  # absorbs remainder so C_d + C_h + C_w == C
+
+        def sincos_1d(n: int, c: int) -> torch.Tensor:
+            c_even = c if c % 2 == 0 else c - 1  # handle odd channel counts
+            pos = torch.arange(n, dtype=torch.float32, device=device).unsqueeze(1)
+            freq = torch.exp(
+                -torch.arange(0, c_even, 2, dtype=torch.float32, device=device)
+                * (math.log(10000.0) / c_even)
+            )
+            pe = torch.zeros(n, c, device=device)
+            pe[:, :c_even:2] = torch.sin(pos * freq)
+            pe[:, 1:c_even:2] = torch.cos(pos * freq)
+            return pe  # last channel is 0 if c is odd
+
+        pe_d = sincos_1d(D, C_d)[:, None, None, :].expand(D, H, W, C_d)
+        pe_h = sincos_1d(H, C_h)[None, :, None, :].expand(D, H, W, C_h)
+        pe_w = sincos_1d(W, C_w)[None, None, :, :].expand(D, H, W, C_w)
+        return torch.cat([pe_d, pe_h, pe_w], dim=-1).reshape(1, D * H * W, C)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, *spatial = x.shape
         N = int(np.prod(spatial))
         x_flat = x.view(B, C, N).permute(0, 2, 1)  # (B, N, C)
-        x_norm = self.norm(x_flat)
-        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
-        x_flat = x_flat + attn_out  # residual
+
+        # Inject positional encoding once into the residual stream
+        x_flat = x_flat + self._sincos_3d(*spatial, C, x.device)
+
+        # Pre-norm attention sublayer
+        normed = self.norm1(x_flat)
+        attn_out, _ = self.attn(normed, normed, normed)
+        x_flat = x_flat + attn_out
+
+        # Pre-norm FFN sublayer
+        x_flat = x_flat + self.ffn(self.norm2(x_flat))
+
         return x_flat.permute(0, 2, 1).view(B, C, *spatial)
 
 
