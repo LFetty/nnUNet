@@ -181,8 +181,8 @@ class nnUNetTrainerRegression_mae_deep(nnUNetTrainerRegression_mae):
         Channel 0: CBCT (input to network)
         Channel 1: CT (target for regression)
         """
-        data = torch.from_numpy(batch['data'])
-        target = torch.from_numpy(batch['target'])
+        data = batch['data']
+        target = batch['target']
 
         data = data.to(self.device, non_blocking=True)
         if isinstance(target, list):
@@ -228,8 +228,8 @@ class nnUNetTrainerRegression_mae_deep(nnUNetTrainerRegression_mae):
         Channel 0: CBCT (input to network)
         Channel 1: CT (target for regression)
         """
-        data = torch.from_numpy(batch['data'])
-        target = torch.from_numpy(batch['target'])
+        data = batch['data']
+        target = batch['target']
 
         data = data.to(self.device, non_blocking=True)
         if isinstance(target, list):

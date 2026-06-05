@@ -342,7 +342,7 @@ class nnUNetTrainerRegression_ts_structure(nnUNetTrainerRegression_advanced):
     # ------------------------------------------------------------------
 
     def train_step(self, batch: dict) -> dict:
-        data = torch.from_numpy(batch["data"]).to(self.device, non_blocking=True)
+        data = batch["data"].to(self.device, non_blocking=True)
         keys: List[str] = [str(k) for k in batch["keys"]]
         bboxes: List[List[Tuple[int, int]]] = batch["bbox"]  # supplied by subclass loader
 
