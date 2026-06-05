@@ -346,11 +346,11 @@ class nnUNetTrainerRegression_mae(nnUNetTrainer):
         self.logger.log('epoch_end_timestamps', time(), self.current_epoch)
 
         # Logging train and validation loss
-        self.print_to_log_file('train_loss', np.round(self.logger.my_fantastic_logging['train_losses'][-1], decimals=4))
-        self.print_to_log_file('val_loss', np.round(self.logger.my_fantastic_logging['val_losses'][-1], decimals=4))
+        self.print_to_log_file('train_loss', np.round(self.logger.get_value('train_losses', step=-1), decimals=4))
+        self.print_to_log_file('val_loss', np.round(self.logger.get_value('val_losses', step=-1), decimals=4))
         
         # Log the duration of the epoch
-        epoch_duration = self.logger.my_fantastic_logging['epoch_end_timestamps'][-1] - self.logger.my_fantastic_logging['epoch_start_timestamps'][-1]
+        epoch_duration = self.logger.get_value('epoch_end_timestamps', step=-1) - self.logger.get_value('epoch_start_timestamps', step=-1)
         self.print_to_log_file(f"Epoch time: {np.round(epoch_duration, decimals=2)} s")
 
         # Checkpoint handling for best and periodic saves
@@ -359,8 +359,8 @@ class nnUNetTrainerRegression_mae(nnUNetTrainer):
             self.save_checkpoint(join(self.output_folder, 'checkpoint_latest.pth'))
 
         best_metric = 'val_losses'  # Use validation loss as best metric for regression
-        if self._best_ema is None or self.logger.my_fantastic_logging[best_metric][-1] < self._best_ema:
-            self._best_ema = self.logger.my_fantastic_logging[best_metric][-1]
+        if self._best_ema is None or self.logger.get_value(best_metric, step=-1) < self._best_ema:
+            self._best_ema = self.logger.get_value(best_metric, step=-1)
             self.print_to_log_file(f"Yayy! New best EMA MAE: {np.round(self._best_ema, decimals=4)}")
             self.save_checkpoint(join(self.output_folder, 'checkpoint_best.pth'))
 
