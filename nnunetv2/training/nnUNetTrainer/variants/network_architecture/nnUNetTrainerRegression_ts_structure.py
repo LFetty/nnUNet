@@ -94,12 +94,14 @@ class _nnUNetDataLoaderWithBbox(nnUNetDataLoader):
     """
 
     _ts_cache_dir: Optional[Path] = None
+    _ts_source_cache_dir: Optional[Path] = None
     _ts_feature_stages: List[str] = []
     _ts_feat_strides: Dict[str, Tuple[int, int, int]] = {}
 
     @classmethod
-    def set_ts_cache(cls, cache_dir, stages, strides):
+    def set_ts_cache(cls, cache_dir, stages, strides, source_cache_dir=None):
         cls._ts_cache_dir = Path(cache_dir)
+        cls._ts_source_cache_dir = Path(source_cache_dir) if source_cache_dir else None
         cls._ts_feature_stages = list(stages)
         cls._ts_feat_strides = dict(strides)
 
@@ -119,6 +121,7 @@ class _nnUNetDataLoaderWithBbox(nnUNetDataLoader):
         # Lazy per-worker handle caches (empty after fork → repopulated here).
         if not hasattr(self, "_lbl_handles"):
             self._lbl_handles: Dict[str, object] = {}
+            self._src_lbl_handles: Dict[str, object] = {}
             self._feat_handles: Dict[str, Dict[str, object]] = {}
 
         keys = [str(k) for k in out["keys"]]
@@ -134,6 +137,19 @@ class _nnUNetDataLoaderWithBbox(nnUNetDataLoader):
                 self._lbl_handles[key] = h
             ts_labels[b, 0] = _crop_and_pad_3d(h, bbox, patch_shape, pad_value=0)
         out["ts_labels"] = ts_labels
+
+        if self._ts_source_cache_dir is not None:
+            ts_source_labels = np.zeros((B, 1, *patch_shape), dtype=np.int64)
+            for b, (key, bbox) in enumerate(zip(keys, self._pending_bboxes)):
+                h = self._src_lbl_handles.get(key)
+                if h is None:
+                    h = blosc2.open(
+                        urlpath=str(self._ts_source_cache_dir / f"{key}_ts_source_labels.b2nd"),
+                        mode="r",
+                    )
+                    self._src_lbl_handles[key] = h
+                ts_source_labels[b, 0] = _crop_and_pad_3d(h, bbox, patch_shape, pad_value=0)
+            out["ts_source_labels"] = ts_source_labels
 
         # Features (per stage)
         ts_feats: Dict[str, np.ndarray] = {}
@@ -192,6 +208,7 @@ class nnUNetTrainerRegression_ts_structure(nnUNetTrainerRegression_advanced):
 
         self._ts_results_dir = os.environ.get("TS_RESULTS_DIR")
         self._ts_cache_dir = os.environ.get("TS_CACHE_DIR")
+        self._ts_source_cache_dir: Optional[str] = os.environ.get("TS_SOURCE_CACHE_DIR")
         self._ts_config = os.environ.get("TS_CONFIG", "3d_fullres")
         self._ts_fold = int(os.environ.get("TS_FOLD", "0"))
         # Optional: pre-cached GT TS segmentations produced by
@@ -226,6 +243,7 @@ class nnUNetTrainerRegression_ts_structure(nnUNetTrainerRegression_advanced):
 
         # Infer feature strides once from a single cached case (workers read directly).
         self._cache_dir = Path(self._ts_cache_dir)
+        self._source_cache_dir = Path(self._ts_source_cache_dir) if self._ts_source_cache_dir else None
         self._feat_strides: Dict[str, Tuple[int, int, int]] = {}
         sample_labels = sorted(self._cache_dir.glob("*_ts_labels.b2nd"))
         if not sample_labels:
@@ -245,6 +263,15 @@ class nnUNetTrainerRegression_ts_structure(nnUNetTrainerRegression_advanced):
             f"stages: {self.ts_feature_stages} | strides: {self._feat_strides} | "
             f"w_seg={self.w_ts_seg} w_feat={self.w_ts_feat}"
         )
+        self.w_ts_source_seg = float(os.environ.get("TS_SOURCE_SEG_WEIGHT", "0.05"))
+        if self._source_cache_dir is not None:
+            sample_source = sorted(self._source_cache_dir.glob("*_ts_source_labels.b2nd"))
+            if not sample_source:
+                raise FileNotFoundError(f"No *_ts_source_labels.b2nd files in {self._source_cache_dir}")
+            self.print_to_log_file(
+                f"TS source-MR structure cache active | cases cached: {len(sample_source)} | "
+                f"w_source_seg={self.w_ts_source_seg}"
+            )
 
     # ------------------------------------------------------------------
     # Data loader override: use the bbox-aware loader so train_step can crop
@@ -267,7 +294,7 @@ class nnUNetTrainerRegression_ts_structure(nnUNetTrainerRegression_advanced):
             probabilistic_oversampling=self.probabilistic_oversampling,
         )
         _nnUNetDataLoaderWithBbox.set_ts_cache(
-            self._cache_dir, self.ts_feature_stages, self._feat_strides
+            self._cache_dir, self.ts_feature_stages, self._feat_strides, self._source_cache_dir
         )
         dl_tr = _nnUNetDataLoaderWithBbox(dataset_tr, self.batch_size, patch, patch, **kwargs)
         dl_val = _nnUNetDataLoaderWithBbox(dataset_val, self.batch_size, patch, patch, **kwargs)
@@ -370,6 +397,14 @@ class nnUNetTrainerRegression_ts_structure(nnUNetTrainerRegression_advanced):
         ts_out = self.ts_loss(pred_hr, cached_labels, cached_feats)
 
         l = l_reg + self.w_ts_seg * ts_out["seg_loss"] + self.w_ts_feat * ts_out["feat_loss"]
+        source_seg_loss = None
+        if "ts_source_labels" in batch:
+            source_labels = torch.from_numpy(batch["ts_source_labels"]).to(self.device, non_blocking=True)
+            source_seg_loss = self.ts_loss.coarse_segmentation_loss(
+                self.ts_loss.predict_coarse_probs(pred_hr, collect_features=False),
+                source_labels,
+            )
+            l = l + self.w_ts_source_seg * source_seg_loss
 
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
@@ -382,12 +417,15 @@ class nnUNetTrainerRegression_ts_structure(nnUNetTrainerRegression_advanced):
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
 
-        return {
+        out = {
             "loss": l.detach().cpu().numpy(),
             "loss_reg": l_reg.detach().cpu().numpy(),
             "loss_ts_seg": ts_out["seg_loss"].cpu().numpy(),
             "loss_ts_feat": ts_out["feat_loss"].cpu().numpy(),
         }
+        if source_seg_loss is not None:
+            out["loss_ts_source_seg"] = source_seg_loss.detach().cpu().numpy()
+        return out
 
     # ------------------------------------------------------------------
     # Validation metrics: regression + segmentation Dice
@@ -637,5 +675,4 @@ def _crop_and_pad_3d(
     final_slice = tuple(slice(0, min(patch_shape[d], cropped.shape[d])) for d in range(dim))
     out[final_slice] = cropped[final_slice]
     return out
-
 

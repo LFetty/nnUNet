@@ -203,20 +203,39 @@ class TSStructureLoss(nn.Module):
         Returns:
             dict with scalar tensors: 'loss', 'seg_loss', 'feat_loss'.
         """
-        self._features.clear()
+        coarse_probs = self.predict_coarse_probs(pred_norm, collect_features=True)
+        seg_loss = self.coarse_segmentation_loss(coarse_probs, cached_labels)
+
+        feat_losses = []
+        for name in self.feature_stages:
+            pred_feat = self._features[name].float()
+            tgt_feat = cached_features[name].to(pred_feat.dtype).to(pred_feat.device)
+            if pred_feat.shape != tgt_feat.shape:
+                raise ValueError(
+                    f"TS feature shape mismatch at stage '{name}': "
+                    f"pred {tuple(pred_feat.shape)} vs cached {tuple(tgt_feat.shape)}"
+                )
+            feat_losses.append(F.l1_loss(pred_feat, tgt_feat))
+        feat_loss = torch.stack(feat_losses).mean() if feat_losses else torch.zeros((), device=pred_norm.device)
+
+        total = self.w_seg * seg_loss + self.w_feat * feat_loss
+        return {"loss": total, "seg_loss": seg_loss.detach(), "feat_loss": feat_loss.detach()}
+
+    def predict_coarse_probs(self, pred_norm: torch.Tensor, collect_features: bool = False) -> torch.Tensor:
+        if collect_features:
+            self._features.clear()
         ts_in = self._to_ts_input(pred_norm)
 
-        # Run TS in fp16 autocast for speed (frozen weights; softmax+aggregation cast back to fp32).
         with torch.amp.autocast(device_type=ts_in.device.type, enabled=ts_in.device.type == "cuda",
                                 dtype=torch.float16):
             logits = self._net(ts_in)
             if isinstance(logits, (list, tuple)):
                 logits = logits[0]
 
-        probs = torch.softmax(logits.float(), dim=1)  # [B, C_ts, D, H, W]
-        # Aggregate TS classes → coarse tissues via einsum (single kernel).
-        coarse_probs = torch.einsum("bcdhw,cn->bndhw", probs, self._coarse_agg)
+        probs = torch.softmax(logits.float(), dim=1)
+        return torch.einsum("bcdhw,cn->bndhw", probs, self._coarse_agg)
 
+    def coarse_segmentation_loss(self, coarse_probs: torch.Tensor, cached_labels: torch.Tensor) -> torch.Tensor:
         target = cached_labels.long()
         if target.ndim == 5:
             target = target.squeeze(1)
@@ -230,20 +249,4 @@ class TSStructureLoss(nn.Module):
         denom = coarse_probs.sum(dim=dims) + target_1h.sum(dim=dims)
         dice = (2 * inter + self._dice_smooth) / (denom + self._dice_smooth)
         dice_loss = 1.0 - dice[1:].mean()
-
-        seg_loss = ce_loss + dice_loss
-
-        feat_losses = []
-        for name in self.feature_stages:
-            pred_feat = self._features[name].float()
-            tgt_feat = cached_features[name].to(pred_feat.dtype).to(pred_feat.device)
-            if pred_feat.shape != tgt_feat.shape:
-                raise ValueError(
-                    f"TS feature shape mismatch at stage '{name}': "
-                    f"pred {tuple(pred_feat.shape)} vs cached {tuple(tgt_feat.shape)}"
-                )
-            feat_losses.append(F.l1_loss(pred_feat, tgt_feat))
-        feat_loss = torch.stack(feat_losses).mean() if feat_losses else torch.zeros((), device=ts_in.device)
-
-        total = self.w_seg * seg_loss + self.w_feat * feat_loss
-        return {"loss": total, "seg_loss": seg_loss.detach(), "feat_loss": feat_loss.detach()}
+        return ce_loss + dice_loss
