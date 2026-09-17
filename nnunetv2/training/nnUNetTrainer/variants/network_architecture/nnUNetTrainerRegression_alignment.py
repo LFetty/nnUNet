@@ -15,8 +15,9 @@ Environment overrides:
     ALIGN_SIGLIP_CKPT   SigLIP checkpoint (simcbct-siglip best.pt) for the `_siglip` trainer; simcbct_siglip must
                         be on PYTHONPATH and <preprocessed dataset>/siglip_stats.json must exist
                         (controlled-deformation-benchmark scripts/siglip_norm_stats.py)
-    ALIGN_SIGLIP_TOKENS token grid of the SigLIP crop: "full" (default, largest grid in the patch) or e.g. 8,12,12
-                        (SigLIP's training crop, random position; more sensitive per mm, noisier)
+    ALIGN_SIGLIP_MODE   "windows" (default: patch covered by overlapping SigLIP training-size windows), "full"
+                        (whole patch in one pass) or "crop" (one random training-size window)
+    ALIGN_SIGLIP_MAX_WINDOWS  "windows" mode: random subset of this many windows per step (default 0 = all)
 """
 from __future__ import annotations
 
@@ -155,9 +156,9 @@ class nnUNetTrainerRegression_align_siglip(nnUNetTrainerRegression_align_none):
         self.siglip_stats = load_json(stats_file)
         ct_props = self.plans_manager.foreground_intensity_properties_per_channel["1"]
         self.ct_norm = (float(ct_props["mean"]), float(ct_props["std"]))
-        spec = os.environ.get("ALIGN_SIGLIP_TOKENS", "full")
-        tokens = None if spec == "full" else tuple(int(t) for t in spec.split(","))
-        return SigLIPFeatureLoss(os.environ["ALIGN_SIGLIP_CKPT"], self.configuration_manager.spacing, tokens)
+        return SigLIPFeatureLoss(os.environ["ALIGN_SIGLIP_CKPT"], self.configuration_manager.spacing,
+                                 mode=os.environ.get("ALIGN_SIGLIP_MODE", "windows"),
+                                 max_windows=int(os.environ.get("ALIGN_SIGLIP_MAX_WINDOWS", 0)))
 
     def _alignment_term(self, pred, source, keys):
         if keys is None:

@@ -7,7 +7,7 @@ when the target is misaligned with the input, they reward keeping the input's ge
 
 - NMILoss: 2 - NMI with a differentiable Parzen-window joint histogram on a random voxel subset.
 - MINDSSCLoss: mean squared difference of MIND-SSC descriptors (Heinrich et al., MICCAI 2013).
-- SigLIPFeatureLoss: 1 - cosine of frozen simcbct-siglip backbone tokens over the whole patch (takes HU volumes).
+- SigLIPFeatureLoss: 1 - cosine of frozen simcbct-siglip backbone tokens, patch covered by SigLIP-sized windows (HU input).
 
 All return a scalar in float32 and should be evaluated outside autocast.
 """
@@ -112,14 +112,19 @@ class SigLIPFeatureLoss(nn.Module):
     """1 - cosine similarity of frozen SigLIP (simcbct-siglip) backbone tokens of a and b, over body tokens.
 
     Inputs are HU volumes [B, 1, D, H, W] at `spacing_mm` (zyx). They are resampled to the model's voxel size,
-    cropped to a whole number of tokens (`tokens=None`: the largest grid that fits, with a random offset in the
-    remainder; or a fixed grid such as SigLIP's training crop 8x12x12 at a random position), clamped to the HU
-    window and z-scored with the given per-volume statistics (as in SigLIP training). Only `a` receives
-    gradients; the model is frozen.
+    cropped to the largest whole number of tokens (random offset in the remainder), clamped to the HU window and
+    z-scored with the given per-volume statistics (as in SigLIP training). Only `a` receives gradients; the model
+    is frozen. Modes:
+      - "windows" (default): the token grid is covered by the fewest overlapping windows of `window` tokens
+        (SigLIP's training crop), embedded in one batch; the loss averages over every window token.
+        `max_windows` > 0 uses a random subset of that many windows per call (cheaper, still unbiased).
+      - "full": the whole token grid in one pass (larger than any SigLIP training crop).
+      - "crop": one window of `window` tokens at a random position.
     Needs `simcbct_siglip` on PYTHONPATH.
     """
 
-    def __init__(self, checkpoint: str, spacing_mm, tokens=None, min_body: float = 0.5,
+    def __init__(self, checkpoint: str, spacing_mm, mode: str = "windows", window=None, max_windows: int = 0,
+                 min_body: float = 0.5,
                  body_threshold_hu: float = -500.0):
         super().__init__()
         from simcbct_siglip.model.aligner import load_aligner
@@ -132,9 +137,13 @@ class SigLIPFeatureLoss(nn.Module):
         self.encoder.grad_checkpointing = True
         self.patch = tuple(int(p) for p in pairs["patch"])
         self.voxel_mm = tuple(float(t) / p for t, p in zip(pairs["token_mm"], self.patch))
-        self.window = tuple(float(w) for w in pairs["window"])
+        self.hu_window = tuple(float(w) for w in pairs["window"])
         self.spacing_mm = tuple(float(s) for s in spacing_mm)
-        self.tokens = None if tokens is None else tuple(int(t) for t in tokens)
+        if mode not in ("windows", "full", "crop"):
+            raise ValueError(f"unknown mode {mode!r}")
+        self.mode = mode
+        self.max_windows = int(max_windows)
+        self.window = tuple(int(t) for t in (window or pairs["tokens"]))
         self.min_body = min_body
         self.body_threshold_hu = body_threshold_hu
 
@@ -143,28 +152,45 @@ class SigLIPFeatureLoss(nn.Module):
         return super().train(True)
 
     def _geometry(self, shape):
-        """Resampled size, crop size and random crop start for a spatial input shape."""
+        """Resampled size, crop size, random crop start and window starts (voxels, within the crop)."""
         size = [round(n * s / v) for n, s, v in zip(shape, self.spacing_mm, self.voxel_mm)]
-        if self.tokens is None:
-            tokens = [max(n // p, 1) for n, p in zip(size, self.patch)]
-        else:
-            tokens = list(self.tokens)
-        crop = [t * p for t, p in zip(tokens, self.patch)]
+        grid = [max(n // p, w if self.mode == "crop" else 1) for n, p, w in zip(size, self.patch, self.window)]
+        if self.mode == "crop":
+            grid = list(self.window)
+        elif self.mode == "windows":
+            grid = [max(g, w) for g, w in zip(grid, self.window)]
+        crop = [g * p for g, p in zip(grid, self.patch)]
         size = [max(n, c) for n, c in zip(size, crop)]
         starts = [int(torch.randint(0, n - c + 1, (1,))) for n, c in zip(size, crop)]
-        return size, crop, starts
+        if self.mode == "windows":
+            per_axis = []
+            for g, w, p in zip(grid, self.window, self.patch):
+                n = -(-g // w)  # fewest windows covering the axis, evenly spaced
+                per_axis.append(sorted({round(i * (g - w) / max(n - 1, 1)) * p for i in range(n)}))
+            windows = [(z, y, x) for z in per_axis[0] for y in per_axis[1] for x in per_axis[2]]
+            if 0 < self.max_windows < len(windows):
+                windows = [windows[i] for i in torch.randperm(len(windows))[: self.max_windows].tolist()]
+        else:
+            windows = [(0, 0, 0)]
+        return size, crop, starts, windows
 
-    @staticmethod
-    def _resample_crop(x: torch.Tensor, size, crop, starts) -> torch.Tensor:
+    def _resample_crop(self, x: torch.Tensor, size, crop, starts, windows) -> torch.Tensor:
+        """[B, 1, ...] -> [B * n_windows, 1, ...] (window order is the same for every call)."""
         x = F.interpolate(x, size=size, mode="trilinear", align_corners=False)
-        return x[:, :, starts[0]:starts[0] + crop[0], starts[1]:starts[1] + crop[1], starts[2]:starts[2] + crop[2]]
+        x = x[:, :, starts[0]:starts[0] + crop[0], starts[1]:starts[1] + crop[1], starts[2]:starts[2] + crop[2]]
+        if self.mode != "windows":
+            return x
+        w = [t * p for t, p in zip(self.window, self.patch)]
+        return torch.cat([x[:, :, z:z + w[0], y:y + w[1], q:q + w[2]] for z, y, q in windows])
 
     def _normalize(self, hu: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
         view = (-1,) + (1,) * (hu.ndim - 1)
-        return (hu.clamp(*self.window) - mean.view(view)) / std.view(view)
+        return (hu.clamp(*self.hu_window) - mean.view(view)) / std.view(view)
 
     def forward(self, a_hu, b_hu, a_mean, a_std, b_mean, b_std) -> torch.Tensor:
         geometry = self._geometry(a_hu.shape[2:])
+        repeats = len(geometry[3]) if self.mode == "windows" else 1
+        a_mean, a_std, b_mean, b_std = (v.repeat(repeats) for v in (a_mean, a_std, b_mean, b_std))
         a = self._resample_crop(a_hu.float(), *geometry)
         with torch.no_grad():
             b = self._resample_crop(b_hu.float(), *geometry)
