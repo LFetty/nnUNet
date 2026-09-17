@@ -12,6 +12,10 @@ Environment overrides:
     ALIGN_NMI_BINS      histogram bins for NMI (default 32)
     ALIGN_NMI_SAMPLES   voxels sampled per patch for NMI (default 50000)
     ALIGN_NUM_EPOCHS    number of epochs (default: the base trainer's 1000), e.g. for the λ search
+    ALIGN_SIGLIP_CKPT   SigLIP checkpoint (simcbct-siglip best.pt) for the `_siglip` trainer; simcbct_siglip must
+                        be on PYTHONPATH and <preprocessed dataset>/siglip_stats.json must exist
+                        (controlled-deformation-benchmark scripts/siglip_norm_stats.py)
+    ALIGN_SIGLIP_TOKENS token grid of the SigLIP crop (default 8,12,12, as in SigLIP training)
 """
 from __future__ import annotations
 
@@ -21,7 +25,9 @@ import numpy as np
 import torch
 from torch import autocast
 
-from nnunetv2.training.loss.alignment_losses import MINDSSCLoss, NMILoss
+from batchgenerators.utilities.file_and_folder_operations import join, load_json
+
+from nnunetv2.training.loss.alignment_losses import MINDSSCLoss, NMILoss, SigLIPFeatureLoss
 from nnunetv2.training.nnUNetTrainer.variants.network_architecture.nnUNetTrainerRegression_mae_deep import (
     nnUNetTrainerRegression_mae_deep,
 )
@@ -48,7 +54,10 @@ class nnUNetTrainerRegression_align_none(nnUNetTrainerRegression_mae_deep):
     def _build_alignment_loss(self):
         return None
 
-    def _compute_losses(self, data: torch.Tensor):
+    def _alignment_term(self, pred: torch.Tensor, source: torch.Tensor, keys) -> torch.Tensor:
+        return self.alignment_loss(pred, source)
+
+    def _compute_losses(self, data: torch.Tensor, keys=None):
         input_data = data[:, 0:1]
         target_data = data[:, 1:2]
 
@@ -65,14 +74,14 @@ class nnUNetTrainerRegression_align_none(nnUNetTrainerRegression_mae_deep):
         if self.alignment_loss is None or self.align_weight == 0:
             loss_align = torch.zeros((), device=data.device)
         else:
-            loss_align = self.alignment_loss(pred_hr.float(), input_data.float())
+            loss_align = self._alignment_term(pred_hr.float(), input_data.float(), keys)
         loss = loss_reg + self.align_weight * loss_align
         return loss, loss_reg, loss_align
 
     def train_step(self, batch: dict) -> dict:
         data = batch["data"].to(self.device, non_blocking=True)
         self.optimizer.zero_grad(set_to_none=True)
-        loss, loss_reg, loss_align = self._compute_losses(data)
+        loss, loss_reg, loss_align = self._compute_losses(data, batch.get("keys"))
 
         if self.grad_scaler is not None:
             self.grad_scaler.scale(loss).backward()
@@ -94,7 +103,7 @@ class nnUNetTrainerRegression_align_none(nnUNetTrainerRegression_mae_deep):
     def validation_step(self, batch: dict) -> dict:
         data = batch["data"].to(self.device, non_blocking=True)
         with torch.no_grad():
-            loss, loss_reg, loss_align = self._compute_losses(data)
+            loss, loss_reg, loss_align = self._compute_losses(data, batch.get("keys"))
         return {
             "loss": loss.detach().cpu().numpy(),
             "loss_reg": loss_reg.detach().cpu().numpy(),
@@ -128,3 +137,33 @@ class nnUNetTrainerRegression_align_mind(nnUNetTrainerRegression_align_none):
 
     def _build_alignment_loss(self):
         return MINDSSCLoss(radius=2, dilation=2)
+
+
+class nnUNetTrainerRegression_align_siglip(nnUNetTrainerRegression_align_none):
+    """MAE + ALIGN_WEIGHT * (1 - cos) of frozen SigLIP backbone tokens of prediction and input.
+
+    The network sees normalized data, SigLIP needs HU: the prediction is de-normalized with the plans' global
+    CT statistics (channel 1), the input CBCT (per-image z-score, channel 0) with its per-case statistics from
+    siglip_stats.json. SigLIP's own per-volume statistics come from the same file (CT stats for the prediction).
+    """
+
+    align_weight: float = 1.0
+
+    def _build_alignment_loss(self):
+        stats_file = join(self.preprocessed_dataset_folder_base, "siglip_stats.json")
+        self.siglip_stats = load_json(stats_file)
+        ct_props = self.plans_manager.foreground_intensity_properties_per_channel["1"]
+        self.ct_norm = (float(ct_props["mean"]), float(ct_props["std"]))
+        tokens = tuple(int(t) for t in os.environ.get("ALIGN_SIGLIP_TOKENS", "8,12,12").split(","))
+        return SigLIPFeatureLoss(os.environ["ALIGN_SIGLIP_CKPT"], self.configuration_manager.spacing, tokens)
+
+    def _alignment_term(self, pred, source, keys):
+        if keys is None:
+            raise RuntimeError("the SigLIP alignment term needs the case keys of the batch")
+        stats = [self.siglip_stats[k] for k in keys]
+        col = lambda name: torch.tensor([s[name] for s in stats], device=pred.device, dtype=torch.float32)
+        view = (-1, 1, 1, 1, 1)
+        pred_hu = pred * self.ct_norm[1] + self.ct_norm[0]
+        source_hu = source * col("zscore_std").view(view) + col("zscore_mean").view(view)
+        return self.alignment_loss(pred_hu, source_hu, col("ct_mean"), col("ct_std"),
+                                   col("cbct_mean"), col("cbct_std"))
