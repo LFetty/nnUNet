@@ -80,3 +80,27 @@ When loading pretrained weights, all layers except the segmentation layers will 
 So far there are no specific nnUNet trainers for fine tuning, so the current recommendation is to just use
 nnUNetTrainer. You can however easily write your own trainers with learning rate ramp up, fine-tuning of segmentation
 heads or shorter training time.
+
+## Debugging pretrained initialization collapse
+
+If a fine-tuning run shows early collapse, background-only predictions, or slice banding after loading pretrained
+weights, you can probe the exact same training setup before launching a full run:
+
+```bash
+python scripts/debug_training_collapse.py FINETUNING_DATASET CONFIG FOLD \
+    --pretrained_weights PATH_TO_CHECKPOINT \
+    --trainer nnUNetTrainer \
+    --plans nnUNetPlans \
+    --sample-batches 4 \
+    --probe-steps 4 \
+    --output-json debug_report.json
+```
+
+The script compares scratch vs pretrained initialization on the same sampled patches and reports:
+
+- pretrained weight transfer coverage
+- split size and empty-patch risk
+- dummy-2D augmentation / downsampling risk
+- early prediction collapse signals (single-class dominance, foreground suppression, entropy drop)
+- gradient/update stability
+- slice periodicity and gap metrics that are often correlated with banding artifacts

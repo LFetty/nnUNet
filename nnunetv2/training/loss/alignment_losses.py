@@ -7,7 +7,7 @@ when the target is misaligned with the input, they reward keeping the input's ge
 
 - NMILoss: 2 - NMI with a differentiable Parzen-window joint histogram on a random voxel subset.
 - MINDSSCLoss: mean squared difference of MIND-SSC descriptors (Heinrich et al., MICCAI 2013).
-- SigLIPFeatureLoss: 1 - cosine of frozen simcbct-siglip backbone tokens (takes HU volumes).
+- SigLIPFeatureLoss: 1 - cosine of frozen simcbct-siglip backbone tokens over the whole patch (takes HU volumes).
 
 All return a scalar in float32 and should be evaluated outside autocast.
 """
@@ -112,12 +112,14 @@ class SigLIPFeatureLoss(nn.Module):
     """1 - cosine similarity of frozen SigLIP (simcbct-siglip) backbone tokens of a and b, over body tokens.
 
     Inputs are HU volumes [B, 1, D, H, W] at `spacing_mm` (zyx). They are resampled to the model's voxel size,
-    randomly cropped to the token grid used in SigLIP training, clamped to the HU window and z-scored with the
-    given per-volume statistics (as in SigLIP training). Only `a` receives gradients; the model is frozen.
+    cropped to a whole number of tokens (`tokens=None`: the largest grid that fits, with a random offset in the
+    remainder; or a fixed grid such as SigLIP's training crop 8x12x12 at a random position), clamped to the HU
+    window and z-scored with the given per-volume statistics (as in SigLIP training). Only `a` receives
+    gradients; the model is frozen.
     Needs `simcbct_siglip` on PYTHONPATH.
     """
 
-    def __init__(self, checkpoint: str, spacing_mm, tokens=(8, 12, 12), min_body: float = 0.5,
+    def __init__(self, checkpoint: str, spacing_mm, tokens=None, min_body: float = 0.5,
                  body_threshold_hu: float = -500.0):
         super().__init__()
         from simcbct_siglip.model.aligner import load_aligner
@@ -132,7 +134,7 @@ class SigLIPFeatureLoss(nn.Module):
         self.voxel_mm = tuple(float(t) / p for t, p in zip(pairs["token_mm"], self.patch))
         self.window = tuple(float(w) for w in pairs["window"])
         self.spacing_mm = tuple(float(s) for s in spacing_mm)
-        self.tokens = tuple(int(t) for t in tokens)
+        self.tokens = None if tokens is None else tuple(int(t) for t in tokens)
         self.min_body = min_body
         self.body_threshold_hu = body_threshold_hu
 
@@ -140,28 +142,32 @@ class SigLIPFeatureLoss(nn.Module):
         # stay in train mode so that the encoder uses gradient checkpointing; the model has no dropout
         return super().train(True)
 
-    def _resample_crop(self, x: torch.Tensor, starts) -> torch.Tensor:
-        size = [max(round(n * s / v), t * p) for n, s, v, t, p in
-                zip(x.shape[2:], self.spacing_mm, self.voxel_mm, self.tokens, self.patch)]
-        x = F.interpolate(x, size=size, mode="trilinear", align_corners=False)
-        crop = [t * p for t, p in zip(self.tokens, self.patch)]
-        return x[:, :, starts[0]:starts[0] + crop[0], starts[1]:starts[1] + crop[1], starts[2]:starts[2] + crop[2]]
+    def _geometry(self, shape):
+        """Resampled size, crop size and random crop start for a spatial input shape."""
+        size = [round(n * s / v) for n, s, v in zip(shape, self.spacing_mm, self.voxel_mm)]
+        if self.tokens is None:
+            tokens = [max(n // p, 1) for n, p in zip(size, self.patch)]
+        else:
+            tokens = list(self.tokens)
+        crop = [t * p for t, p in zip(tokens, self.patch)]
+        size = [max(n, c) for n, c in zip(size, crop)]
+        starts = [int(torch.randint(0, n - c + 1, (1,))) for n, c in zip(size, crop)]
+        return size, crop, starts
 
-    def _starts(self, shape) -> list[int]:
-        size = [max(round(n * s / v), t * p) for n, s, v, t, p in
-                zip(shape, self.spacing_mm, self.voxel_mm, self.tokens, self.patch)]
-        crop = [t * p for t, p in zip(self.tokens, self.patch)]
-        return [int(torch.randint(0, n - c + 1, (1,))) for n, c in zip(size, crop)]
+    @staticmethod
+    def _resample_crop(x: torch.Tensor, size, crop, starts) -> torch.Tensor:
+        x = F.interpolate(x, size=size, mode="trilinear", align_corners=False)
+        return x[:, :, starts[0]:starts[0] + crop[0], starts[1]:starts[1] + crop[1], starts[2]:starts[2] + crop[2]]
 
     def _normalize(self, hu: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
         view = (-1,) + (1,) * (hu.ndim - 1)
         return (hu.clamp(*self.window) - mean.view(view)) / std.view(view)
 
     def forward(self, a_hu, b_hu, a_mean, a_std, b_mean, b_std) -> torch.Tensor:
-        starts = self._starts(a_hu.shape[2:])
-        a = self._resample_crop(a_hu.float(), starts)
+        geometry = self._geometry(a_hu.shape[2:])
+        a = self._resample_crop(a_hu.float(), *geometry)
         with torch.no_grad():
-            b = self._resample_crop(b_hu.float(), starts)
+            b = self._resample_crop(b_hu.float(), *geometry)
             body = F.avg_pool3d((b > self.body_threshold_hu).float(), self.patch).flatten(1) >= self.min_body
         if not body.any():
             return torch.zeros((), device=a_hu.device)
